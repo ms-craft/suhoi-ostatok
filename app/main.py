@@ -14,6 +14,7 @@ from app.ai import AIProvider, FakeAIProvider, GeminiAIProvider
 from app.config import Settings, get_settings
 from app.core import ApiError, configure_logging, event, new_id, request_id
 from app.db import make_session_factory
+from app.privacy import PrivacyClient
 from app.queue import JobQueue, make_queue
 from app.storage import Storage, make_storage
 
@@ -145,6 +146,7 @@ def create_app(
         else:
             ai_provider = FakeAIProvider()
     app.state.ai_provider = ai_provider
+    app.state.privacy = PrivacyClient(settings)
 
     app.add_middleware(RequestBoundary, max_body=settings.max_request_bytes)
     for router in (accounts.router, billing.router, submissions.router, subjects.router):
@@ -183,6 +185,8 @@ def create_app(
             "redis": state.queue.ping,
             "object_storage": state.storage.ping,
         }
+        if state.settings.privacy_mode == "require" and state.settings.ai_provider == "gemini":
+            checks["privacy"] = state.privacy.health
         dependencies = {}
         for name, check in checks.items():
             try:

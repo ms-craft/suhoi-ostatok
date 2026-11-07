@@ -14,6 +14,7 @@ from app.ai import (
 )
 from app.billing import settle_check
 from app.core import as_utc, event, job_context, new_id, utcnow, worker_heartbeat
+from app.privacy import PrivacyUnavailable
 from app.submission_models import (
     DetectedTask, ProcessingJob, SourceFile, Submission, SubmissionPage, TaskAnalysis, TeacherEdit,
 )
@@ -241,11 +242,21 @@ def _analyze(state, claim: Claim) -> list[Analysis]:
         matched = existing
     else:
         source = _source_pages(state, pages)
+        local_name = None
+        # В Gemini отправляем только обезличенные страницы. Fake-провайдер
+        # работает локально и в анонимизации не нуждается.
+        if getattr(provider, "name", None) == "gemini" and getattr(state, "privacy", None) and state.privacy.enabled:
+            try:
+                source, local_name = state.privacy.redact_pages(source)
+            except PrivacyUnavailable:
+                raise AIError("privacy_unavailable", retryable=True) from None
         _stage(state, claim, "recognition")
         if hasattr(provider, "recognize_with_name"):
             found, student_name = provider.recognize_with_name(source, clarification, subject=subject, subject_category=subject_category)
+            student_name = local_name or student_name
         else:
             found = provider.recognize(source, clarification)
+            student_name = local_name
         recognition = validate_recognition(found, source)
         matched = _match_tasks(recognition, existing)
 

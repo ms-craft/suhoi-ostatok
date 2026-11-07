@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-3.8-flash"
     gemini_recognition_model: str = "gemini-3.5-flash-lite"
     gemini_humanities_model: str = "gemini-3.8-flash"
+
+    # Локальная анонимизация перед отправкой страниц в Gemini.
+    # off — не использовать; auto — при недоступности сайдкара отправить
+    # оригинал; require — без анонимизации запрос в Gemini не выполняется.
+    privacy_mode: Literal["off", "auto", "require"] = "auto"
+    privacy_url: str = "http://127.0.0.1:8790"
+    privacy_timeout_seconds: int = Field(default=120, ge=5, le=600)
+    privacy_token: SecretStr | None = None
     payment_provider: Literal["fake"] = "fake"
     fake_payment_secret: SecretStr | None = None
     plans_json: str | None = None
