@@ -364,6 +364,45 @@ def _fail(state, claim: Claim, code: str, retryable: bool) -> None:
           level="WARNING" if retry else "ERROR")
 
 
+
+def _notify_telegram(state, claim: Claim) -> None:
+    """Fetch completed submission data and dispatch Telegram notification."""
+    from sqlalchemy import select
+    from app.submission_models import DetectedTask, Submission
+    from app.core import as_utc
+
+    with state.session_factory() as db:
+        row = db.get(Submission, claim.submission_id)
+        if row is None:
+            return
+        tasks_rows = db.scalars(
+            select(DetectedTask)
+            .where(DetectedTask.submission_id == claim.submission_id)
+            .order_by(DetectedTask.position)
+        ).all()
+
+    submission_meta = {
+        "id": row.id,
+        "student_reference": row.student_reference,
+        "created_at": as_utc(row.created_at).isoformat() if row.created_at else None,
+    }
+    tasks_data = [
+        {
+            "recognition": t.recognition,
+            "preliminary": t.preliminary,
+            "teacher": t.teacher,
+        }
+        for t in tasks_rows
+    ]
+    notify_student_after_review(
+        state,
+        submission_id=claim.submission_id,
+        student_reference=row.student_reference,
+        tasks=tasks_data,
+        submission_meta=submission_meta,
+    )
+
+
 def run_job(state, job_id: str) -> None:
     claim = _claim(state, job_id)
     if claim is None:
@@ -394,6 +433,12 @@ def run_job(state, job_id: str) -> None:
         else:
             event("job_stage_completed", stage="saving_results")
             event("job_completed", duration_ms=round((monotonic() - start) * 1000))
+            # --- Telegram notification (fire-and-forget) ----------------
+            try:
+                _notify_telegram(state, claim)
+            except Exception:
+                event("telegram_notify_failed", level="WARNING",
+                      submission_id=claim.submission_id)
     except LeaseLost:
         event("job_lease_lost", level="WARNING")
     finally:

@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     auth_token_ttl_seconds: int = Field(default=86400, ge=60, le=604800)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
+    # Optional Telegram Bot token.  When set, the bot service and automatic
+    # student notifications are enabled.
+    telegram_bot_token: SecretStr | None = None
+
     max_file_bytes: int = Field(default=12 * 1024 * 1024, ge=1, le=30 * 1024 * 1024)
     max_request_bytes: int = Field(default=32 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
     max_pages: int = Field(default=10, ge=1, le=20)
