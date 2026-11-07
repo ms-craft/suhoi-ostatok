@@ -4,7 +4,7 @@ from alembic import context
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
-from app import accounts, billing, submission_models, subjects  # noqa: F401
+from app import accounts, billing, submission_models, subjects, telegram_models, workspace  # noqa: F401
 from app.config import get_settings
 from app.db import Base
 

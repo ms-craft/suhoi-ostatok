@@ -68,6 +68,7 @@ class RecognizedTask(AIRecord):
     kind: TaskKind = TaskKind.UNKNOWN
     region: AnswerRegion | None = None
     ambiguity: ShortText | None = None
+    corrections: list[ShortText] = Field(default_factory=list, max_length=100)
 
     @model_validator(mode="after")
     def consistent_answer(self) -> "RecognizedTask":

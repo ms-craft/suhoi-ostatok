@@ -322,6 +322,19 @@ def test_transient_ai_failure_retries_same_reservation_and_duplicate_is_safe(bui
     assert harness.subscription(auth)["checks_remaining"] == 0
 
 
+def test_single_attempt_stops_automatic_resends_and_releases_reservation(build_harness):
+    provider = FlakyProvider(retryable=True)
+    harness = build_harness(ai_provider=provider, max_attempts=1)
+    auth, _ = harness.register()
+    harness.subscribe(auth)
+    submission = harness.queued_submission(auth)
+    harness.process(submission['job_id'])
+    harness.process(submission['job_id'])
+    assert provider.calls == 1
+    assert harness.submission(auth, submission['id'])['status'] == 'failed'
+    assert harness.subscription(auth)['checks_remaining'] == 1
+
+
 def test_terminal_ai_failure_refunds_reservation_and_exposes_stage(build_harness):
     provider = FlakyProvider(retryable=False)
     harness = build_harness(ai_provider=provider)

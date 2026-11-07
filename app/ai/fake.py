@@ -11,6 +11,9 @@ class FakeAIProvider:
     def __init__(self, fixtures: list[RecognizedTask] | None = None):
         self.fixtures = fixtures
 
+    def extract_questions(self, page: PageInput) -> list[str]:
+        return ['Демонстрационное задание: вычислите 2 + 2.']
+
     def recognize(
         self, pages: list[PageInput], clarification: str | None
     ) -> list[RecognizedTask]:

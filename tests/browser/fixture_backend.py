@@ -23,6 +23,9 @@ class BrowserFixtureAI(FakeAIProvider):
         super().__init__()
         self.failed_once: set[bytes] = set()
 
+    def extract_questions(self, page):
+        return ['Вычислите 2 + 2', 'Решите x + 1 = 3']
+
     def recognize(self, pages, clarification):
         # Distinct synthetic pages exercise terminal failure, retry and an empty result.
         sleep(1.6)

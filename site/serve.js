@@ -50,7 +50,7 @@ function proxy(req, res, url) {
     response.on('error', () => res.destroy());
     response.pipe(res);
   });
-  upstream.setTimeout(60_000, () => upstream.destroy());
+  upstream.setTimeout(url.pathname === '/v1/question-import' ? 150_000 : 60_000, () => upstream.destroy());
   upstream.on('error', () => {
     if (res.destroyed || res.writableEnded) return;
     if (res.headersSent) {

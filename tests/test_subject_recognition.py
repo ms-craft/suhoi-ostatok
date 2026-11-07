@@ -31,6 +31,60 @@ def test_subject_selects_recognition_model(monkeypatch, subject, expected, opena
     assert request['json']['model'] == expected if openai_compatible else f'/{expected}:generateContent' in url
 
 
+@pytest.mark.parametrize('openai_compatible', [True, False])
+def test_recognition_sends_strikethrough_instructions(monkeypatch, openai_compatible):
+    captured = []
+
+    def post(url, **kwargs):
+        captured.append(kwargs['json'])
+        if openai_compatible:
+            return httpx.Response(200, json={'choices': [{'finish_reason': 'stop', 'message': {'content': '{"tasks": []}'}}]})
+        return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP', 'content': {'parts': [{'text': '{"tasks": []}'}]}}]})
+
+    monkeypatch.setattr('app.ai.gemini.httpx.post', post)
+    endpoint = 'https://example.test/v1' if openai_compatible else 'https://generativelanguage.googleapis.com/v1beta/models'
+    provider = GeminiAIProvider('key', api_base=endpoint)
+    provider.recognize_with_name([PageInput(1, b'image', 'image/jpeg')], None, subject='russian')
+    payload = captured[0]
+    instruction = payload['messages'][0]['content'] if openai_compatible else payload['systemInstruction']['parts'][0]['text']
+    assert 'вставь исправление в соответствующее место ответа' in instruction
+    assert 'Зачёркнутые буквы' in instruction
+    assert 'итоговая запись — «жэвёт»' in instruction
+    assert 'Сам факт исправления не является неопределённостью' in instruction
+    assert 'в corrections' in instruction
+    assert 'не записывай сам факт зачёркивания или исправления в ambiguity' in instruction
+    assert 'не заменяй\nэто число на «2»' in instruction
+
+
+@pytest.mark.parametrize(('answer', 'status'), [('живёт', 'correct'), ('жэвёт', 'incorrect')])
+def test_corrections_are_saved_without_blocking_reference_review(build_harness, answer, status):
+    from app.ai import FakeAIProvider, PreliminaryReview, RecognizedTask
+
+    class Provider(FakeAIProvider):
+        def recognize_with_name(self, pages, clarification, subject=None, subject_category=None):
+            return [RecognizedTask(page_number=1, answer=answer, answer_state='present', kind='open',
+                                   corrections=['В слове исправлена буква'])], None
+
+        def review_reference(self, task, reference, clarification):
+            assert task.corrections == ['В слове исправлена буква']
+            assert reference['answer'] == 'живёт'
+            return PreliminaryReview(status='incorrect', explanation='жэвёт вместо живёт')
+
+    harness = build_harness(ai_provider=Provider())
+    auth, _ = harness.register()
+    harness.subscribe(auth)
+    response = harness.client.post('/v1/submissions', headers=auth, files=[photograph()],
+                                   data={'test_subject': 'russian', 'test_questions': json.dumps([{'question': 'Диктант', 'answer': 'живёт'}])})
+    assert response.status_code == 202, response.text
+    submission = response.json()
+    harness.process(submission['job_id'])
+    task, = harness.results(auth, submission['id'])['tasks']
+    assert task['recognition']['corrections'] == ['В слове исправлена буква']
+    assert task['recognition']['ambiguity'] is None
+    assert task['preliminary']['status'] == status
+    assert task['preliminary']['expected_answer'] == 'живёт'
+
+
 def test_subject_is_saved_with_submission_and_old_snapshots_work(harness):
     auth, _ = harness.register()
     harness.subscribe(auth)

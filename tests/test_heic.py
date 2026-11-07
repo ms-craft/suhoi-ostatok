@@ -74,3 +74,17 @@ def test_heic_preview_enforces_limits_and_validates_content(build_harness):
                                    files={'file': ('broken.heic', b'\x00\x00\x00\x18ftypheicbroken', 'image/heic')})
     assert response.status_code == 422
     assert harness.app.state.storage.objects == {}
+
+
+def test_image_over_20_megapixels_is_resized():
+    from app.config import Settings
+    from app.files import render_image
+
+    source = BytesIO()
+    Image.new('RGB', (4600, 4600), 'white').save(source, format='PNG')
+    settings = Settings(_env_file=None)
+    assert settings.max_image_pixels == 64_000_000
+    result = render_image(source.getvalue(), 'PNG', settings)
+    with Image.open(BytesIO(result)) as image:
+        assert image.format == 'JPEG'
+        assert image.size == (2000, 2000)

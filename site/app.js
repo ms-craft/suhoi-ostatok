@@ -68,15 +68,31 @@
   let subscriptionEpoch = 0;
   let focusBeforeModal;
   let workspace = { classes: [], tests: [], links: {} };
+  let workspaceSync = { ready: false, revision: 0, dirty: false, running: false, error: '', conflict: null };
   let activeClass = null;
   let activeTest = '';
   let editingTest = '';
   let addingWorkspaceItem = '';
   let workspaceError = '';
+  let telegramClassCode = null;
+  let telegramClassInfo = null;
+  let telegramStudentToRemove = null;
+  let telegramDelivery = null;
+  let editingStudentName = false;
+  const questionImports = new Map();
   let subjectCatalog = [];
   let workspaceDelete = null;
   const workspaceKey = () => `stopkadr.workspace.${api.getSession()?.user_id || ''}`;
-  function saveWorkspace() { localStorage.setItem(workspaceKey(), JSON.stringify(workspace)); }
+  const workspaceMetaKey = () => `${workspaceKey()}.sync`;
+  function saveWorkspaceMeta() {
+    localStorage.setItem(workspaceMetaKey(), JSON.stringify({ revision: workspaceSync.revision, dirty: workspaceSync.dirty }));
+  }
+  function saveWorkspace() {
+    localStorage.setItem(workspaceKey(), JSON.stringify(workspace));
+    workspaceSync.dirty = true;
+    saveWorkspaceMeta();
+    void flushWorkspace();
+  }
   function loadWorkspace() {
     try {
       const value = JSON.parse(localStorage.getItem(workspaceKey()) || '{}');
@@ -85,6 +101,84 @@
     activeClass = null;
     activeTest = '';
     workspaceDelete = null;
+  }
+  function workspaceHasData(value) {
+    return value.classes.length > 0 || value.tests.length > 0 || Object.keys(value.links).length > 0;
+  }
+  async function initializeWorkspace() {
+    const session = api.getSession(), sync = workspaceSync;
+    sync.error = '';
+    if (state.screen === 'home') render();
+    try {
+      const remote = await api.request('/v1/workspace');
+      if (session !== api.getSession() || sync !== workspaceSync) return;
+      const localExists = localStorage.getItem(workspaceKey()) !== null;
+      let meta = null;
+      try { meta = JSON.parse(localStorage.getItem(workspaceMetaKey()) || 'null'); } catch { /* preserve local data */ }
+      const remoteData = remote.workspace;
+      const same = remoteData && JSON.stringify(remoteData) === JSON.stringify(workspace);
+      const localUnsent = meta?.dirty === true || (!meta && localExists && workspaceHasData(workspace));
+      if (remoteData && localUnsent && !same && (!meta || meta.revision !== remote.revision)) {
+        sync.conflict = remote;
+        sync.revision = Number.isInteger(meta?.revision) ? meta.revision : 0;
+        sync.dirty = true;
+        return;
+      }
+      sync.revision = remote.revision;
+      if (remoteData && (!localUnsent || same)) {
+        workspace = remoteData;
+        localStorage.setItem(workspaceKey(), JSON.stringify(workspace));
+        sync.dirty = false;
+      } else {
+        sync.dirty = true;
+      }
+      sync.ready = true;
+      saveWorkspaceMeta();
+      if (sync.dirty) void flushWorkspace();
+    } catch (error) {
+      if (session !== api.getSession() || sync !== workspaceSync) return;
+      sync.error = errorText(error);
+    } finally {
+      if (session === api.getSession() && sync === workspaceSync && state.screen === 'home') render();
+    }
+  }
+  async function flushWorkspace() {
+    const session = api.getSession(), sync = workspaceSync;
+    if (!session || !sync.ready || sync.running || sync.conflict) return;
+    const hadError = !!sync.error;
+    sync.running = true;
+    try {
+      while (sync.dirty && sync.ready && session === api.getSession() && sync === workspaceSync) {
+        const snapshot = JSON.stringify(workspace);
+        const result = await api.request('/v1/workspace', { method: 'PUT', body: { revision: sync.revision, workspace: JSON.parse(snapshot) } });
+        if (session !== api.getSession() || sync !== workspaceSync) return;
+        sync.revision = result.revision;
+        sync.dirty = JSON.stringify(workspace) !== snapshot;
+        sync.error = '';
+        saveWorkspaceMeta();
+      }
+    } catch (error) {
+      if (session !== api.getSession() || sync !== workspaceSync) return;
+      sync.dirty = true;
+      try { saveWorkspaceMeta(); } catch { /* local copy remains available */ }
+      if (error.code === 'workspace_conflict') {
+        try {
+          const remote = await api.request('/v1/workspace');
+          if (session !== api.getSession() || sync !== workspaceSync) return;
+          sync.conflict = remote;
+          sync.ready = false;
+          toast('Данные изменились на другом устройстве. Откройте главную и выберите версию.', true);
+        } catch { sync.error = 'Не удалось проверить изменения на сервере.'; }
+      } else {
+        sync.error = 'Не удалось синхронизировать данные с сервером. Изменения сохранены на этом устройстве.';
+        toast(sync.error, true);
+      }
+    } finally {
+      if (session === api.getSession() && sync === workspaceSync) {
+        sync.running = false;
+        if (state.screen === 'home' && (hadError || sync.error || sync.conflict)) render();
+      }
+    }
   }
   const newId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
 
@@ -117,6 +211,15 @@
   }
 
   function viewHome() {
+    if (!workspaceSync.ready) {
+      if (workspaceSync.conflict) return `<div class="card card-pad stack"><h1 class="section-title">Выберите версию данных</h1>
+        <p>На сервере и на этом устройстве есть разные несохранённые изменения. Какую версию использовать?</p>
+        ${btn('workspace-use-server', 'Загрузить с сервера', 'btn-ghost btn-block')}
+        ${btn('workspace-use-local', 'Сохранить версию устройства', 'btn-primary btn-block')}</div>`;
+      if (workspaceSync.error) return `<div class="card card-pad stack"><h1 class="section-title">Не удалось загрузить кабинет</h1>
+        <p class="form-error" role="alert">${esc(workspaceSync.error)}</p>${btn('workspace-retry', 'Попробовать снова', 'btn-ghost btn-block')}</div>`;
+      return '<p class="empty" role="status">Загружаем классы и работы…</p>';
+    }
     const classes = workspace.classes.map(item => {
       const count = Object.values(workspace.links).filter(link => link.classId === item.id).length;
       if (workspaceDelete?.kind === 'class' && workspaceDelete.id === item.id) {
@@ -148,6 +251,7 @@
       <span>Заданий: ${Array.isArray(item.questions) ? item.questions.length : 0}</span></span>${icon('chevRight', 18)}</button><button type="button" class="home-delete home-delete-work" data-act="ask-delete-workspace" data-kind="test" data-id="${esc(item.id)}" aria-label="Удалить работу ${esc(item.name)}">${icon('trash', 17)}</button></div>`).join('');
     const unassigned = Object.values(workspace.links).filter(link => !link.classId).length;
     return `<div class="teacher-home">
+      ${workspaceSync.error ? `<div class="callout blue"><p>${esc(workspaceSync.error)}</p>${btn('workspace-retry-save', 'Повторить синхронизацию', 'btn-ghost btn-block')}</div>` : ''}
       <div class="home-intro"><p>Личный кабинет учителя</p><h1>Всё по папкам</h1>
         <p>Классы, задания и работы учеников — в одном месте.</p></div>
       <section class="home-section" aria-labelledby="classes-heading">
@@ -184,6 +288,7 @@
     const legacy = LEGACY_SUBJECTS.find(([value]) => value === test.subject);
     const subjectName = legacy?.[1] || test.subject || '';
     const category = subjectCategory(test);
+    const imported = questionImports.get(test.id);
     return `${back('home', test.name, 'Задания и правильные ответы')}
       <div class="card card-pad" style="margin-bottom:14px">
         <label class="form-field">Предмет
@@ -201,6 +306,25 @@
           <button type="button" class="question-move" data-act="move-question" data-index="${i}" data-step="-1" aria-label="Переместить задание ${i + 1} вверх" ${i === 0 ? 'disabled' : ''}>↑</button>
           <button type="button" class="question-move" data-act="move-question" data-index="${i}" data-step="1" aria-label="Переместить задание ${i + 1} вниз" ${i === questions.length - 1 ? 'disabled' : ''}>↓</button>
         </div></div><p style="white-space:pre-wrap">${mathText(q.question)}</p><p class="page-sub">Правильный ответ: ${mathText(q.answer)}</p><button type="button" class="btn btn-quiet" data-act="remove-question" data-index="${i}">Удалить</button></div>`).join('')}
+      ${imported?.questions?.length ? `<form id="import-answers-form" class="card card-pad stack" style="margin-bottom:14px">
+        <h2>Задания с фотографии</h2>
+        <p class="page-sub">Проверьте условия и их порядок, затем впишите правильный ответ под каждым заданием.</p>
+        ${imported.questions.map((item, i) => `<div class="import-question stack-sm">
+          <label class="form-field">Задание ${questions.length + i + 1}<textarea data-import-index="${i}" data-import-field="question" maxlength="8000" rows="3" required>${esc(item.question)}</textarea></label>
+          <label class="form-field">Правильный ответ<textarea data-import-index="${i}" data-import-field="answer" maxlength="3000" rows="2" required>${esc(item.answer)}</textarea></label>
+          <button type="button" class="btn btn-ghost btn-sm import-remove" data-act="remove-import-question" data-index="${i}">${icon('trash', 17)} Убрать задание</button>
+        </div>`).join('')}
+        ${imported.error ? `<p class="form-error" role="alert">${esc(imported.error)}</p>` : ''}
+        <button type="submit" class="btn btn-primary btn-block">Сохранить задания</button>
+        ${btn('cancel-question-import', 'Отменить распознавание', 'btn-ghost btn-block')}
+      </form>` : `<form id="question-photo-form" class="card card-pad stack" style="margin-bottom:14px">
+        <h2>Задания с фотографии</h2>
+        <p class="page-sub">Выберите фотографию печатных заданий. Она будет отправлена для распознавания; запрос к модели может быть платным.</p>
+        <label class="form-field">Фотография<input type="file" name="photo" accept="image/jpeg,image/png,image/heic,image/heif,.jpg,.jpeg,.png,.heic,.heif" required ${imported?.pending ? 'disabled' : ''}></label>
+        ${imported?.error ? `<p class="form-error" role="alert">${esc(imported.error)}</p>` : ''}
+        <button type="submit" class="btn btn-ghost btn-block" ${imported?.pending ? 'disabled' : ''}>${imported?.pending ? 'Распознаём задания…' : 'Распознать задания'}</button>
+        ${imported?.pending ? '<p class="page-sub" role="status">Ожидаем ответ модели. Не запускайте повторно.</p>' : ''}
+      </form>`}
       <form id="question-form" class="card card-pad stack">
         <h2>Новое задание</h2>
         <label class="form-field">Условие<textarea name="question" maxlength="8000" required rows="3"></textarea></label>
@@ -243,6 +367,56 @@
       return;
     }
     workspaceError = '';
+    render();
+  }
+
+  async function importQuestionPhoto(form) {
+    const file = form.elements.photo.files[0];
+    const testId = editingTest;
+    if (!file || questionImports.get(testId)?.pending) return;
+    const draft = { pending: true, questions: [], error: '' };
+    questionImports.set(testId, draft);
+    const body = new FormData();
+    body.append('file', file);
+    render();
+    try {
+      const result = await api.request('/v1/question-import', { method: 'POST', body });
+      if (questionImports.get(testId) !== draft) return;
+      draft.questions = result.questions.map(item => ({ question: item.question, answer: '' }));
+      if (!draft.questions.length) draft.error = 'Задания не найдены. Попробуйте фотографию получше или добавьте задание вручную.';
+      if (result.demonstration) draft.error = 'Демонстрационный результат: фотография не распознавалась.';
+    } catch (error) {
+      if (questionImports.get(testId) !== draft) return;
+      draft.error = error?.code === 'network_error' || error?.code === 'api_unavailable'
+        ? 'Связь прервалась. Запрос мог быть платным; проверьте состояние у провайдера перед повтором.'
+        : errorText(error);
+    } finally {
+      draft.pending = false;
+      if (state.screen === 'test' && editingTest === testId && questionImports.get(testId) === draft) render();
+    }
+  }
+
+  function saveImportedQuestions() {
+    const test = workspace.tests.find(item => item.id === editingTest);
+    const draft = questionImports.get(editingTest);
+    if (!test || !draft?.questions.length) return;
+    const additions = draft.questions.map(item => ({ question: item.question.trim(), answer: item.answer.trim() }));
+    if (additions.some(item => !item.question || !item.answer)) return;
+    const previous = test.questions;
+    const combined = [...(Array.isArray(previous) ? previous : []), ...additions];
+    if (combined.length > 50 || JSON.stringify(combined).length > 30000) {
+      draft.error = 'В работе допускается до 50 заданий и 30 000 символов условий и ответов.';
+      render();
+      return;
+    }
+    test.questions = combined;
+    try { saveWorkspace(); } catch {
+      test.questions = previous;
+      draft.error = 'Не удалось сохранить задания в браузере.';
+      render();
+      return;
+    }
+    questionImports.delete(editingTest);
     render();
   }
   const selectedPreviews = new Map();
@@ -372,6 +546,7 @@
   function subscriptionBlock() {
     const sub = state.subscription;
     if (!sub) return '';
+    if (sub.sheet_billing) return sub.checks_remaining <= 0 ? 'Лимит листов исчерпан.' : '';
     if (!['active', 'past_due'].includes(sub.status) ||
         Date.parse(sub.period_start) > Date.now() || !(Date.parse(sub.period_end) > Date.now())) {
       return 'Для проверки нужна действующая подписка.';
@@ -457,6 +632,24 @@
         <h1 class="page-title">${esc(workspace.classes.find(item => item.id === activeClass)?.name || 'Работы')}</h1>
         <p class="page-sub">Сфотографируйте листы одной работы — соберём ответы и найдём ошибки.</p>
       </div>
+      <div class="card card-pad stack-sm" style="margin-bottom:14px">
+        <h2 class="section-title">Telegram для учеников</h2>
+        <p class="page-sub">Выдайте ученикам код класса. Каждый один раз введёт его и своё ФИО в боте.</p>
+        <p class="page-sub">Сообщайте код только ученикам этого класса: регистрация использует введённое ими ФИО.</p>
+        ${telegramClassInfo?.classId === activeClass && telegramClassInfo.exists && !telegramClassCode?.code ? '<p class="page-sub">Код уже создан. Новый код заменит предыдущий для новых регистраций; зарегистрированные ученики сохранятся.</p>' : ''}
+        ${telegramClassInfo?.classId === activeClass && !telegramClassInfo.bot_configured ? '<p class="form-error">Бот ещё не подключён: на сервере нужен TELEGRAM_BOT_TOKEN.</p>' : ''}
+        ${telegramClassCode?.classId === activeClass && telegramClassCode.code ? `<label class="form-field">Код класса
+          <input value="${esc(telegramClassCode.code)}" readonly aria-label="Код класса для Telegram"></label>
+          <p class="page-sub">Команда ученика: /link КОД_КЛАССА Фамилия Имя. Новый код заменит предыдущий; зарегистрированные ученики сохранятся.</p>
+          ${!telegramClassInfo && !telegramClassCode.configured ? '<p class="form-error">Бот ещё не подключён: на сервере нужен TELEGRAM_BOT_TOKEN.</p>' : ''}` : ''}
+        ${telegramClassCode?.classId === activeClass && telegramClassCode.error ? `<p class="form-error" role="alert">${esc(telegramClassCode.error)}</p>` : ''}
+        ${btn('telegram-class-code', (telegramClassCode?.classId === activeClass && telegramClassCode.code) || (telegramClassInfo?.classId === activeClass && telegramClassInfo.exists) ? 'Создать новый код' : 'Создать код класса', 'btn-ghost', '', state.pending ? 'disabled' : '')}
+        ${telegramClassInfo?.classId === activeClass && telegramClassInfo.exists ? btn('telegram-refresh-class', 'Обновить список учеников', 'btn-quiet btn-sm') : ''}
+        ${telegramClassInfo?.classId === activeClass && telegramClassInfo.students.length ? `<div class="stack-sm"><b>Зарегистрированные ученики</b>
+          ${telegramClassInfo.students.map(student => `<div class="between"><span>${esc(student.name)}</span>${telegramStudentToRemove === student.id
+            ? `<span>${btn('telegram-remove-student', 'Отключить', 'btn-ghost btn-sm', '', `data-id="${esc(student.id)}"`)} ${btn('telegram-cancel-remove', 'Отмена', 'btn-quiet btn-sm')}</span>`
+            : btn('telegram-ask-remove', 'Отвязать', 'btn-quiet btn-sm', '', `data-id="${esc(student.id)}"`)}</div>`).join('')}</div>` : ''}
+      </div>
       <label class="form-field" style="margin-bottom:14px">Работа
         <select id="work-test"><option value="">Без выбранной работы</option>${workspace.tests.map(item => `<option value="${esc(item.id)}" ${activeTest === item.id ? 'selected' : ''}>${esc(item.name)}</option>`).join('')}</select>
       </label>
@@ -480,7 +673,7 @@
       ${block || state.subscriptionError ? `<div class="callout blue" style="margin-top:12px">
         <p>${esc(block || state.subscriptionError)}</p>
         ${btn('billing', 'Открыть подписку', 'btn-quiet btn-block')}
-      </div>` : sub ? `<p class="page-sub" style="margin:12px 2px">Осталось проверок: ${esc(sub.checks_remaining)} · до ${esc(sub.max_pages)} стр. в работе</p>` : ''}`;
+      </div>` : sub ? `<p class="page-sub" style="margin:12px 2px">${sub.sheet_billing ? 'Осталось листов' : 'Осталось проверок'}: ${esc(sub.checks_remaining)} · до ${esc(sub.max_pages)} стр. в работе</p>` : ''}`;
   }
 
   function viewSheets() {
@@ -603,7 +796,13 @@
         <div class="sheet-list">${rows || empty(tasks.length ? 'По этому фильтру нет заданий.' : 'Задания не найдены. Проверьте исходную страницу или добавьте уточнение.')}</div>
       </div>
       <div class="stack-sm" style="margin-top:12px">
+        <div id="telegram-delivery-status" class="card card-pad stack-sm">${telegramDeliveryContent(work.id)}</div>
         ${btn('preview', 'Открыть исходную страницу', 'btn-ghost btn-block', 'image')}
+        ${editingStudentName ? `<form id="student-name-form" class="card card-pad stack-sm"><label class="form-field">Фамилия и имя ученика
+          <input name="student_name" maxlength="120" value="${esc(work.student_reference || '')}" required></label>
+          <p class="page-sub">Для Telegram ФИО должно совпадать с регистрацией ученика в этом классе.</p>
+          <button class="btn btn-primary" type="submit" ${state.pending ? 'disabled' : ''}>Сохранить ФИО</button>
+          ${btn('cancel-student-name', 'Отмена', 'btn-ghost')}</form>` : btn('edit-student-name', 'Исправить ФИО ученика', 'btn-ghost btn-block')}
         ${btn('clarify', 'Добавить уточнение или страницу', 'btn-ghost btn-block', 'plus')}
         ${deleteControls()}
       </div>`;
@@ -637,15 +836,83 @@
       </div>`;
   }
 
-  function textDetail(label, content) {
+  function textDetail(label, content, attribute = '') {
     return `<div class="task-detail">
-      <div class="eyebrow">${esc(label)}</div><p>${mathText(content || '—')}</p>
+      <div class="eyebrow">${esc(label)}</div><p ${attribute}>${mathText(content || '—')}</p>
     </div>`;
+  }
+
+  function findAnswerFragment(root, fragment) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const matches = [];
+    let node;
+    while ((node = walker.nextNode())) {
+      if (node.parentElement?.closest('.katex')) continue;
+      let position = -1;
+      while ((position = node.data.indexOf(fragment, position + 1)) !== -1) {
+        const before = node.data[position - 1] || '';
+        const after = node.data[position + fragment.length] || '';
+        if ((/[\p{L}\p{N}]/u.test(fragment[0]) && /[\p{L}\p{N}]/u.test(before)) ||
+            (/[\p{L}\p{N}]/u.test(fragment.at(-1)) && /[\p{L}\p{N}]/u.test(after))) continue;
+        matches.push({ node, position });
+      }
+    }
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  function linkExplanationReferences(body) {
+    const answer = body.querySelector('[data-student-answer]');
+    const explanation = body.querySelector('[data-review-explanation]');
+    if (!answer || !explanation) return;
+    const walker = document.createTreeWalker(explanation, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    while (walker.nextNode()) if (!walker.currentNode.parentElement?.closest('.katex')) nodes.push(walker.currentNode);
+    for (const node of nodes) {
+      const quote = /«([^«»\n]{1,200})»|“([^“”\n]{1,200})”/g;
+      let match, last = 0;
+      const replacement = document.createDocumentFragment();
+      let linked = false;
+      while ((match = quote.exec(node.data))) {
+        const fragment = match[1] || match[2];
+        const preceding = node.data.slice(Math.max(0, match.index - 80), match.index);
+        if (/(?:вместо|эталон(?:е|а)?|правильно|пропущен(?:о|а|ы)?(?:\s+слово)?)\s*[:—-]?\s*$/iu.test(preceding)) continue;
+        if (!findAnswerFragment(answer, fragment)) continue;
+        replacement.append(document.createTextNode(node.data.slice(last, match.index) + match[0][0]));
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'answer-reference';
+        button.textContent = fragment;
+        button.setAttribute('aria-label', `Показать в ответе: ${fragment}`);
+        button.addEventListener('click', () => {
+          const old = answer.querySelector('mark.answer-highlight');
+          if (old) { old.replaceWith(document.createTextNode(old.textContent)); answer.normalize(); }
+          const target = findAnswerFragment(answer, fragment);
+          if (!target) return;
+          const range = document.createRange();
+          range.setStart(target.node, target.position);
+          range.setEnd(target.node, target.position + fragment.length);
+          const mark = document.createElement('mark');
+          mark.className = 'answer-highlight';
+          mark.tabIndex = -1;
+          range.surroundContents(mark);
+          mark.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'center' });
+          mark.focus({ preventScroll: true });
+        });
+        replacement.append(button, document.createTextNode(match[0].at(-1)));
+        last = quote.lastIndex;
+        linked = true;
+      }
+      if (linked) {
+        replacement.append(document.createTextNode(node.data.slice(last)));
+        node.replaceWith(replacement);
+      }
+    }
   }
 
   function detailContent(task) {
     const review = task.preliminary;
     const rec = task.recognition;
+    const original = task.original_recognition || rec;
     const teacher = task.teacher || {};
     const editedAnswer = Object.hasOwn(teacher, 'answer');
     const answerColor = editedAnswer ? 'original' : review.status === 'incorrect' ? 'err' : 'ref';
@@ -672,17 +939,21 @@
         ${textDetail('Распознанное условие', rec.condition || 'Условие не найдено')}
         <div class="compare">
           <div class="cell ${answerColor}"${review.expected_answer ? '' : ' style="grid-column:1/-1"'}>
-            <div class="l">${editedAnswer ? 'Исходное распознавание ответа' : 'Ответ ученика'}</div><div class="v">${mathText(rec.answer || '—')}</div>
+            <div class="l">${editedAnswer ? 'Исходное распознавание ответа' : 'Ответ ученика'}</div><div class="v" ${editedAnswer ? '' : 'data-student-answer'}>${mathText(rec.answer || '—')}</div>
           </div>
           ${review.expected_answer ? `<div class="cell ref">
             <div class="l">${review.expected_answer_source === 'teacher_test' ? 'Ответ учителя в работе' : 'Предполагаемый верный ответ'}</div><div class="v">${mathText(review.expected_answer)}</div>
           </div>` : ''}
         </div>
-        ${textDetail('Объяснение', review.explanation)}
+        ${original.answer && original.answer !== rec.answer ? textDetail('Первоначальное распознавание ответа', original.answer) : ''}
+        ${textDetail('Объяснение', review.explanation, 'data-review-explanation')}
         ${review.uncertainty ? textDetail('Причина неопределённости', review.uncertainty) : ''}
+        ${rec.ambiguity && rec.ambiguity !== review.uncertainty ? textDetail('Сомнения при распознавании', rec.ambiguity) : ''}
+        ${original.ambiguity && original.ambiguity !== rec.ambiguity && original.ambiguity !== review.uncertainty ? textDetail('Сомнения при первоначальном распознавании', original.ambiguity) : ''}
+        ${rec.corrections?.length ? textDetail('Исправления на листе', rec.corrections.map((item, index) => `${index + 1}. ${item}`).join('\n')) : ''}
         ${review.missing_data?.length ? textDetail('Не хватает данных', review.missing_data.join(' · ')) : ''}
         ${Object.hasOwn(teacher, 'condition') ? textDetail('Условие от учителя', teacher.condition) : ''}
-        ${editedAnswer ? textDetail('Ответ после исправления', teacher.answer) : ''}
+        ${editedAnswer ? textDetail('Ответ после исправления', teacher.answer, 'data-student-answer') : ''}
         ${teacher.status ? textDetail('Оценка учителя', reviewLabel(teacher.status)[0]) : ''}
         ${teacher.explanation ? textDetail('Комментарий учителя', teacher.explanation) : ''}
         ${teacher.confirmed_at ? textDetail('Дата подтверждения', displayDate(teacher.confirmed_at)) : ''}
@@ -763,6 +1034,7 @@
     $('#modalTitle').textContent = modal.mode === 'edit' ? 'Исправление результата' :
       modal.mode === 'clarify' ? 'Уточнение к работе' : workName(state.work);
     body.innerHTML = `${modal.mode === 'clarify' ? '' : previewShell()}${detail}${alert(modal.error, 'modalError')}`;
+    if (modal.mode === 'detail') linkExplanationReferences(body);
     $('#modalFoot').innerHTML = footer;
     body.scrollTop = top ? 0 : topBefore;
     bindPreviewImage();
@@ -916,6 +1188,7 @@
     } else if (state.screen === 'scan') {
       refreshSubscription();
       loadWorks(signal);
+      void refreshTelegramClass(signal);
     } else if (state.screen === 'sheets') {
       loadWorks(signal);
     } else if (state.screen === 'check') {
@@ -932,6 +1205,7 @@
     } else if (state.screen === 'result' && reopen && state.results.tasks.some(task => task.id === reopen)) {
       openModal('detail', reopen);
     }
+    if (state.screen === 'result') void refreshTelegramDelivery(signal);
   }
 
   async function refreshProfile(signal) {
@@ -1054,9 +1328,52 @@
   }
 
   function checkNewWork(work, reopen = null) {
-    if (state.work?.id !== work.id) state.results = null;
+    if (state.work?.id !== work.id) { state.results = null; editingStudentName = false; telegramDelivery = null; }
     state.work = work;
     setScreen('check', { reopen });
+  }
+
+  async function refreshTelegramClass(signal) {
+    const classId = activeClass;
+    if (!classId) return;
+    try {
+      const result = await api.request(`/v1/telegram/classes/${encodeURIComponent(classId)}`, { signal });
+      if (signal?.aborted || activeClass !== classId) return;
+      telegramClassInfo = { classId, ...result };
+      if (state.screen === 'scan') render();
+    } catch (error) {
+      if (!signal?.aborted && activeClass === classId) toast('Не удалось загрузить регистрации Telegram.', true);
+    }
+  }
+
+  function telegramDeliveryContent(workId) {
+    const data = telegramDelivery?.workId === workId ? telegramDelivery : null;
+    const labels = {
+      no_class: 'Работа не связана с классом.', no_class_code: 'Создайте код Telegram в настройках класса.',
+      student_not_linked: 'Ученик не зарегистрирован в боте или ФИО не совпадает.',
+      not_scheduled: 'Результат пока не поставлен в очередь.', pending: 'Ожидает отправки.',
+      sent: 'Отправлено ученику.', failed: 'Не удалось отправить. Проверьте, что ученик не заблокировал бота.',
+      error: 'Не удалось получить состояние отправки.',
+    };
+    return `<h2 class="section-title">Результат в Telegram</h2><p class="page-sub">${esc(data ? (labels[data.status] || 'Состояние неизвестно.') : 'Проверяем состояние…')}</p>
+      ${data && !data.bot_configured ? '<p class="form-error">Бот ещё не запущен: укажите TELEGRAM_BOT_TOKEN на сервере.</p>' : ''}
+      ${data?.status === 'failed' ? btn('telegram-retry-delivery', 'Повторить отправку', 'btn-ghost btn-sm') : ''}
+      ${btn('telegram-refresh-delivery', 'Обновить статус', 'btn-ghost btn-sm')}`;
+  }
+
+  async function refreshTelegramDelivery(signal) {
+    const workId = state.work?.id;
+    if (!workId) return;
+    try {
+      const result = await api.request(`/v1/telegram/submissions/${encodeURIComponent(workId)}/delivery`, { signal });
+      if (signal?.aborted || state.work?.id !== workId) return;
+      telegramDelivery = { workId, ...result };
+    } catch {
+      if (signal?.aborted || state.work?.id !== workId) return;
+      telegramDelivery = { workId, status: 'error', bot_configured: true };
+    }
+    const box = document.getElementById('telegram-delivery-status');
+    if (box) box.innerHTML = telegramDeliveryContent(workId);
   }
 
   const fileKind = file => {
@@ -1104,6 +1421,7 @@
     render();
     try {
       const body = fileBody(state.files);
+      if (activeClass) body.append('class_reference', activeClass);
       const test = workspace.tests.find(item => item.id === activeTest);
       if (test) {
         if (!Array.isArray(test.questions) || !test.questions.length) {
@@ -1338,6 +1656,28 @@
 
   const actions = {
     home: () => setScreen('home'),
+    'workspace-retry': () => { void initializeWorkspace(); },
+    'workspace-retry-save': () => { void flushWorkspace(); },
+    'workspace-use-server': () => {
+      const remote = workspaceSync.conflict;
+      if (!remote?.workspace) return;
+      try {
+        localStorage.setItem(`${workspaceKey()}.conflict-backup`, JSON.stringify(workspace));
+        localStorage.setItem(workspaceKey(), JSON.stringify(remote.workspace));
+        workspace = remote.workspace;
+        Object.assign(workspaceSync, { revision: remote.revision, dirty: false, conflict: null, ready: true, error: '' });
+        saveWorkspaceMeta();
+        render();
+      } catch { toast('Не удалось сохранить резервную копию на устройстве.', true); }
+    },
+    'workspace-use-local': () => {
+      const remote = workspaceSync.conflict;
+      if (!remote) return;
+      Object.assign(workspaceSync, { revision: remote.revision, dirty: true, conflict: null, ready: true, error: '' });
+      try { saveWorkspaceMeta(); } catch { toast('Не удалось сохранить данные на устройстве.', true); return; }
+      render();
+      void flushWorkspace();
+    },
     profile: () => { if (state.screen !== 'profile') { profileBack = state.screen; state.profileError = ''; setScreen('profile'); } },
     'add-class': () => { addingWorkspaceItem = 'class'; workspaceError = ''; render(); $('#workspace-form input')?.focus(); },
     'add-test': () => { addingWorkspaceItem = 'test'; workspaceError = ''; render(); $('#workspace-form input')?.focus(); },
@@ -1371,6 +1711,7 @@
         const ids = Object.entries(workspace.links).filter(([, link]) => link.classId === id).map(([workId]) => workId);
         const removed = [];
         const failed = [];
+        let telegramFailed = false;
         state.pending = true;
         render();
         try {
@@ -1386,11 +1727,15 @@
             }
           }
           if (session !== api.getSession()) return;
+          if (!failed.length) {
+            try { await api.request(`/v1/telegram/classes/${encodeURIComponent(id)}`, { method: 'DELETE' }); }
+            catch { telegramFailed = true; }
+          }
           const previous = workspace;
           const links = { ...workspace.links };
           for (const workId of removed) delete links[workId];
           workspace = { ...workspace, links,
-            classes: failed.length ? workspace.classes : workspace.classes.filter(item => item.id !== id) };
+            classes: failed.length || telegramFailed ? workspace.classes : workspace.classes.filter(item => item.id !== id) };
           try { saveWorkspace(); } catch {
             workspace = previous;
             toast('Не удалось сохранить изменения в браузере. Повторите удаление.', true);
@@ -1402,7 +1747,9 @@
             if (workPreviews.has(workId)) URL.revokeObjectURL(workPreviews.get(workId));
             workPreviews.delete(workId);
           }
-          if (failed.length) {
+          if (telegramFailed) {
+            toast('Не удалось удалить регистрации Telegram. Класс сохранён; попробуйте снова.', true);
+          } else if (failed.length) {
             toast(`Не удалось удалить листов: ${failed.length}. Класс сохранён; попробуйте снова.`, true);
           } else {
             if (activeClass === id) activeClass = null;
@@ -1429,8 +1776,62 @@
       render();
     },
     'open-unassigned': () => { activeClass = null; setScreen('sheets'); },
-    'open-class': element => { activeClass = element.dataset.id; activeTest = ''; setScreen('scan'); },
+    'open-class': element => { activeClass = element.dataset.id; activeTest = ''; telegramStudentToRemove = null; setScreen('scan'); },
+    'edit-student-name': () => { editingStudentName = true; render(); document.querySelector('#student-name-form input')?.focus(); },
+    'cancel-student-name': () => { editingStudentName = false; render(); },
+    'telegram-refresh-delivery': () => { void refreshTelegramDelivery(screenController.signal); },
+    'telegram-retry-delivery': async () => {
+      const workId = state.work?.id;
+      if (!workId) return;
+      try {
+        await api.request(`/v1/telegram/submissions/${encodeURIComponent(workId)}/retry-delivery`, { method: 'POST' });
+        await refreshTelegramDelivery(screenController.signal);
+      } catch (error) { toast(errorText(error), true); }
+    },
+    'telegram-ask-remove': element => { telegramStudentToRemove = element.dataset.id; render(); },
+    'telegram-refresh-class': () => { void refreshTelegramClass(screenController.signal); },
+    'telegram-cancel-remove': () => { telegramStudentToRemove = null; render(); },
+    'telegram-remove-student': async element => {
+      const classId = activeClass, session = api.getSession();
+      try {
+        await api.request(`/v1/telegram/classes/${encodeURIComponent(classId)}/students/${encodeURIComponent(element.dataset.id)}`, { method: 'DELETE' });
+        if (session !== api.getSession() || activeClass !== classId) return;
+        telegramStudentToRemove = null;
+        await refreshTelegramClass(screenController.signal);
+      } catch (error) { toast(errorText(error), true); }
+    },
+    'telegram-class-code': async () => {
+      const cls = workspace.classes.find(item => item.id === activeClass);
+      if (!cls || state.pending) return;
+      const session = api.getSession();
+      const classId = cls.id;
+      const submissionIds = Object.entries(workspace.links).filter(([, link]) => link.classId === classId).map(([id]) => id);
+      state.pending = true;
+      telegramClassCode = { classId, code: '', error: '' };
+      render();
+      try {
+        const result = await api.request(`/v1/telegram/classes/${encodeURIComponent(classId)}/code`, {
+          method: 'POST', body: { name: cls.name, submission_ids: submissionIds },
+        });
+        if (session !== api.getSession()) return;
+        telegramClassCode = { classId, code: result.code, configured: result.bot_configured, error: '' };
+      } catch (error) {
+        if (session !== api.getSession()) return;
+        telegramClassCode = { classId, code: '', error: errorText(error) };
+      } finally {
+        if (session === api.getSession()) { state.pending = false; if (state.screen === 'scan') render(); }
+      }
+    },
     'edit-test': element => { editingTest = element.dataset.id; workspaceError = ''; setScreen('test'); },
+    'cancel-question-import': () => { questionImports.delete(editingTest); render(); },
+    'remove-import-question': element => {
+      const draft = questionImports.get(editingTest);
+      const index = Number(element.dataset.index);
+      if (!draft || !Number.isInteger(index) || index < 0 || index >= draft.questions.length) return;
+      draft.questions.splice(index, 1);
+      if (!draft.questions.length) questionImports.delete(editingTest);
+      render();
+    },
     'move-question': element => {
       const test = workspace.tests.find(item => item.id === editingTest);
       const index = Number(element.dataset.index), step = Number(element.dataset.step);
@@ -1563,6 +1964,14 @@
     'delete-confirm': removeWork,
   };
 
+  document.addEventListener('input', event => {
+    const field = event.target.dataset?.importField;
+    if (!['question', 'answer'].includes(field)) return;
+    const index = Number(event.target.dataset.importIndex);
+    const draft = questionImports.get(editingTest);
+    if (draft?.questions[index]) draft.questions[index][field] = event.target.value;
+  });
+
   document.addEventListener('change', event => {
     if (event.target.id === 'work-test') activeTest = event.target.value;
     if (event.target.id === 'test-subject') {
@@ -1607,7 +2016,22 @@
     actions[action](element);
   });
 
-  const formActions = { 'auth-form': submitAuth, 'correction-form': saveCorrection, 'clarification-form': submitClarification, 'workspace-form': addWorkspaceItem, 'question-form': saveQuestion, 'profile-form': saveProfile };
+  async function saveStudentName(form) {
+    const name = form.elements.student_name.value.trim(), work = state.work, session = api.getSession();
+    if (!name || !work) return;
+    state.pending = true;
+    try {
+      const updated = await api.request(workPath(work), { method: 'PATCH', body: { student_reference: name } });
+      if (session !== api.getSession() || state.work?.id !== work.id) return;
+      state.work = updated;
+      editingStudentName = false;
+      toast('ФИО сохранено.');
+      void refreshTelegramDelivery(screenController.signal);
+    } catch (error) { if (session === api.getSession()) toast(errorText(error), true); }
+    finally { if (session === api.getSession()) { state.pending = false; render(); } }
+  }
+
+  const formActions = { 'auth-form': submitAuth, 'correction-form': saveCorrection, 'clarification-form': submitClarification, 'workspace-form': addWorkspaceItem, 'question-form': saveQuestion, 'question-photo-form': importQuestionPhoto, 'import-answers-form': saveImportedQuestions, 'profile-form': saveProfile, 'student-name-form': saveStudentName };
   document.addEventListener('submit', event => {
     const form = event.target;
     if (!Object.hasOwn(formActions, form.id)) return;
@@ -1649,6 +2073,13 @@
   }
 
   api.onSessionChange((session, reason) => {
+    telegramClassCode = null;
+    telegramClassInfo = null;
+    telegramStudentToRemove = null;
+    telegramDelivery = null;
+    editingStudentName = false;
+    questionImports.clear();
+    workspaceSync = { ready: false, revision: 0, dirty: false, running: false, error: '', conflict: null };
     subscriptionEpoch++;
     clearSelectedPreviews();
     clearPreviews(workPreviews);
@@ -1665,6 +2096,7 @@
     $('#toasts').replaceChildren();
     if (session) loadWorkspace();
     setScreen(session ? 'home' : 'auth');
+    if (session) void initializeWorkspace();
   });
 
   window.addEventListener('pagehide', () => {
@@ -1677,4 +2109,5 @@
 
   if (api.getSession()) loadWorkspace();
   setScreen('home');
+  if (api.getSession()) void initializeWorkspace();
 })();

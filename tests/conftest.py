@@ -61,6 +61,7 @@ def build_harness(database_url):
             "database_url": db_url or database_url,
             "fake_payment_secret": "test-signing-key-keep-out-of-logs-2026",
             "plans_json": json.dumps([plan]),
+            "sheet_billing_enabled": False,
             "storage_backend": "memory",
             "queue_backend": "memory",
             "ai_provider": "fake",

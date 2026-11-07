@@ -54,6 +54,41 @@
         ? `<p class="muted small">Период с ${dateFormat.format(new Date(subscription.period_start))}
             по ${dateFormat.format(new Date(subscription.period_end))}</p>` : "";
 
+      if (subscription?.sheet_billing) {
+        const monthlyPlan = plans.find(plan => plan.code === 'monthly1000');
+        const topupPlan = plans.find(plan => plan.code === 'topup140');
+        content.innerHTML = `
+          <section class="callout blue"><div class="eyebrow">Тестовый режим оплаты</div>
+            <p>Оформление пока тестовое: деньги не списываются, реальные платежи не подключены.</p></section>
+          <p data-billing-notice role="status" tabindex="-1">${escape(notice)}</p>
+          ${error ? `<p class="form-error" role="alert">${escape(error)}</p>` : ''}
+          ${busy ? '<p class="empty" role="status">Обновляем данные…</p>' : ''}
+          <section class="card card-pad stack-sm">
+            <h2 class="section-title">Остаток листов</h2>
+            <div class="stat-grid"><div class="stat"><div class="n blue">${escape(subscription.checks_remaining)}</div><div class="l">Всего доступно</div></div>
+              <div class="stat"><div class="n">${escape(subscription.max_pages ?? 100)}</div><div class="l">Листов в одной работе</div></div></div>
+            <p>Бесплатные: ${escape(subscription.free_remaining)} · По подписке: ${escape(subscription.monthly_remaining)} · Докупленные: ${escape(subscription.extra_remaining)}</p>
+            <p class="muted small">Бесплатные 30 листов начисляются один раз. Докупленные листы не сгорают.</p>
+            ${period}
+            ${subscription.cancel_at_period_end ? '<p class="muted small">Продление отменено.</p>' : currentPeriod && subscription.demonstration ? `<button class="btn btn-ghost" type="button" data-billing-action="cancel" ${disabled}>Отменить продление</button>` : ''}
+          </section>
+          ${checkout ? `<section class="card card-pad stack-sm"><h2 class="section-title">Тестовое оформление</h2>
+            <p>Вы выбрали «${escape(checkout.planName)}».</p>
+            <button class="btn btn-primary" type="button" data-billing-action="confirm" ${disabled}>${icon('check', 19)} Подтвердить тестовое оформление</button>
+            <button class="btn btn-ghost" type="button" data-billing-action="dismiss" ${disabled}>Назад</button></section>` : ''}
+          <section class="card card-pad stack-sm"><h2 class="section-title">Подписка</h2>
+            <p><strong>1000 листов · 19,90 BYN / месяц</strong></p>
+            <p class="muted small">Листы подписки действуют в течение оплаченного периода.</p>
+            <button class="btn btn-primary" type="button" data-billing-action="checkout" data-plan="monthly1000" ${busy || currentPeriod || checkout || !monthlyPlan?.demonstration ? 'disabled' : ''}>Оформить тестовую подписку</button>
+          </section>
+          <section class="card card-pad stack-sm"><h2 class="section-title">Дополнительные листы</h2>
+            <p><strong>140 листов · 3,90 BYN</strong></p>
+            <p class="muted small">Докупка доступна с действующей подпиской, пока в месячном пакете есть листы. Докупленные листы не сгорают.</p>
+            <button class="btn btn-ghost" type="button" data-billing-action="checkout" data-plan="topup140" ${busy || checkout || !topupPlan?.demonstration || !currentPeriod || subscription.status !== 'active' || subscription.monthly_remaining < 1 ? 'disabled' : ''}>Докупить тестовый пакет</button>
+          </section>`;
+        return;
+      }
+
       content.innerHTML = `
         <section class="callout blue">
           <div class="eyebrow">Тестовый режим оплаты</div>

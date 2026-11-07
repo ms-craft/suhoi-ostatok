@@ -577,7 +577,17 @@ input, textarea, select { font-size: 16px; }
   border: 1px solid var(--line-2); border-radius: var(--r-xs); background: var(--card);
 }
 .form-field textarea { resize: vertical; }
-.form-field input[type="file"] { width: 100%; min-width: 0; min-height: 32px; }
+.form-field input[type="file"] {
+  width: 100%; min-width: 0; min-height: 48px; padding: 4px;
+  border: 1px solid var(--line-2); border-radius: var(--r-xs);
+  background: var(--card); color: var(--ink-3); font-size: 14px;
+}
+.form-field input[type="file"]::file-selector-button {
+  min-height: 38px; margin-right: 10px; padding: 8px 12px;
+  border: 0; border-radius: 7px; background: var(--card-2);
+  color: var(--ink); font: inherit; font-weight: 500; cursor: pointer;
+}
+.form-field input[type="file"]:disabled { opacity: .5; }
 .form-field select { width: 100%; min-height: 46px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--ink); font: inherit; }
 .form-error { color: var(--terra-deep); font-size: 14px; overflow-wrap: anywhere; }
 .billing-view { overflow-wrap: anywhere; }
@@ -601,6 +611,11 @@ input, textarea, select { font-size: 16px; }
 .radicand { border-top: 1px solid currentColor; padding: 0 2px; }
 .task-detail, .compare .cell { min-width: 0; overflow-wrap: anywhere; }
 .task-detail, .compare .v { white-space: pre-wrap; }
+.import-question { padding: 14px 0; border-top: 1px solid var(--line-2); }
+.import-remove { align-self: flex-start; color: var(--ink-2); }
+.answer-reference { display: inline; border: 0; padding: 0; background: none; color: var(--blue); font: inherit; text-align: inherit; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.answer-reference:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 2px; }
+.answer-highlight { background: #ffe29a; color: inherit; border-radius: 3px; outline: 2px solid #e0a334; scroll-margin: 24px; }
 .task-status { flex-shrink: 0; }
 .stage-spinner {
   display: grid; place-items: center; position: relative;

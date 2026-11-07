@@ -19,6 +19,7 @@ from app.core import ApiError
 # PDFium is not thread-safe, even for different documents.
 PDF_LOCK = Lock()
 PDF_PROCESS_SLOTS = BoundedSemaphore(1)
+IMAGE_PROCESS_SLOTS = BoundedSemaphore(1)
 PDF_TIMEOUT_SECONDS = 25
 PDF_PAGE_BYTES = 12 * 1024 * 1024
 PDF_OUTPUT_BYTES = 64 * 1024 * 1024
@@ -47,6 +48,8 @@ def invalid_file() -> ApiError:
 
 
 def render_image(content: bytes, image_format: str, settings: Settings) -> bytes:
+    if not IMAGE_PROCESS_SLOTS.acquire(timeout=15):
+        raise ApiError(503, "image_renderer_busy", "Обработка изображений занята. Попробуйте ещё раз.")
     try:
         with Image.open(BytesIO(content), formats=[image_format]) as image:
             if image.width * image.height > settings.max_image_pixels:
@@ -59,6 +62,8 @@ def render_image(content: bytes, image_format: str, settings: Settings) -> bytes
             return normalized_jpeg(ImageOps.exif_transpose(image), settings.page_image_edge)
     except (OSError, ValueError, SyntaxError, EOFError, Image.DecompressionBombError) as error:
         raise invalid_file() from error
+    finally:
+        IMAGE_PROCESS_SLOTS.release()
 
 
 def normalized_jpeg(image: Image.Image, max_edge: int) -> bytes:

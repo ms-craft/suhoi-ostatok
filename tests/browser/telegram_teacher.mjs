@@ -1,0 +1,41 @@
+import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
+const require = createRequire(import.meta.url);
+const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const browser = await chromium.launch({ executablePath: process.env.BROWSER_BIN || undefined, headless: true });
+const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+try {
+  await page.goto(process.env.SITE_URL || 'http://127.0.0.1:58101');
+  await page.locator('[data-act=auth-mode]').click();
+  await page.locator('[name=full_name]').fill('Тестовый учитель');
+  await page.locator('[name=email]').fill(`telegram-${randomUUID()}@example.invalid`);
+  await page.locator('[name=password]').fill('browser-test-only-passphrase');
+  await page.locator('#auth-form [type=submit]').click();
+  await page.locator('[data-act=add-class]').click();
+  await page.locator('#workspace-form [name=name]').fill('7 А');
+  await page.locator('#workspace-form [type=submit]').click();
+  const cls = page.locator('[data-act=open-class]');
+  const classId = await cls.getAttribute('data-id');
+  await cls.click();
+  await page.locator('[data-act=telegram-class-code]').click();
+  const code = await page.getByLabel('Код класса для Telegram').inputValue();
+  assert.match(code, /^[A-Za-z0-9_-]{16}$/);
+  assert.match(await page.locator('#view').innerText(), /Бот ещё не подключён/);
+  const image = await page.evaluate(() => {
+    const canvas = document.createElement('canvas'); canvas.width = canvas.height = 100;
+    return canvas.toDataURL('image/png').split(',')[1];
+  });
+  await page.locator('#gallery-input').setInputFiles({name: 'sheet.png', mimeType: 'image/png', buffer: Buffer.from(image, 'base64')});
+  const request = page.waitForResponse(response => response.url().endsWith('/v1/submissions') && response.request().method() === 'POST');
+  await page.locator('[data-act=start-check]').click();
+  const created = await (await request).json();
+  assert.equal(created.class_reference, classId);
+  await page.locator('#view[data-screen=result]').waitFor({ timeout: 30000 });
+  await page.locator('[data-act=edit-student-name]').click();
+  await page.locator('#student-name-form input').fill('Иванов Иван');
+  await page.locator('#student-name-form [type=submit]').click();
+  await page.getByText('ФИО сохранено.').waitFor();
+  await page.getByText('Ученик не зарегистрирован в боте или ФИО не совпадает.').waitFor();
+  console.log('OK class code, class association and teacher name correction');
+} finally { await browser.close(); }

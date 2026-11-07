@@ -87,10 +87,23 @@ class UsageRecord(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    period_id: Mapped[str] = mapped_column(ForeignKey("usage_periods.id", ondelete="CASCADE"))
+    period_id: Mapped[str | None] = mapped_column(ForeignKey("usage_periods.id", ondelete="CASCADE"))
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    free_pages: Mapped[int] = mapped_column(default=0)
+    monthly_pages: Mapped[int] = mapped_column(default=0)
+    extra_pages: Mapped[int] = mapped_column(default=0)
     status: Mapped[str] = mapped_column(String(8), default="reserved")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SheetTopup(Base):
+    __tablename__ = 'sheet_topups'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'), index=True)
+    checkout_id: Mapped[str] = mapped_column(ForeignKey('checkouts.id', ondelete='CASCADE'), unique=True)
+    pages: Mapped[int]
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class PaymentEvent(Base):
@@ -133,6 +146,12 @@ class PlanView(Plan):
 DEMO_PLAN = Plan(
     code="demo", name="Демонстрационный тариф", checks_limit=10, max_pages=10, allow_followups=True
 )
+SHEET_PLANS = {
+    'monthly1000': Plan(code='monthly1000', name='Подписка на 1000 листов', checks_limit=1000,
+                        max_pages=100, allow_followups=True, price_minor=1990, currency='BYN'),
+    'topup140': Plan(code='topup140', name='Дополнительные 140 листов', checks_limit=140,
+                     max_pages=100, allow_followups=True, price_minor=390, currency='BYN'),
+}
 plan_list = TypeAdapter(list[Plan])
 
 
@@ -202,6 +221,35 @@ def remaining_checks(db: Session, period: UsagePeriod) -> int:
         )
     )
     return max(0, period.checks_limit - consumed)
+
+
+def sheet_balances(db: Session, user_id: str) -> tuple[int, int, int, UsagePeriod | None]:
+    subscription = db.get(Subscription, user_id)
+    checkout = db.get(Checkout, subscription.checkout_id) if subscription and subscription.checkout_id else None
+    period = current_period(db, subscription) if checkout and checkout.plan_code == 'monthly1000' else None
+    active = UsageRecord.status.in_(("reserved", "used"))
+    free_used = db.scalar(select(func.coalesce(func.sum(UsageRecord.free_pages), 0)).where(UsageRecord.user_id == user_id, active))
+    extra_used = db.scalar(select(func.coalesce(func.sum(UsageRecord.extra_pages), 0)).where(UsageRecord.user_id == user_id, active))
+    extra_bought = db.scalar(select(func.coalesce(func.sum(SheetTopup.pages), 0)).where(SheetTopup.user_id == user_id))
+    monthly_used = db.scalar(select(func.coalesce(func.sum(UsageRecord.monthly_pages), 0)).where(UsageRecord.period_id == period.id, active)) if period else 0
+    return max(0, 30 - free_used), max(0, period.checks_limit - monthly_used) if period else 0, max(0, extra_bought - extra_used), period
+
+
+def reserve_sheets(db: Session, user_id: str, pages: int) -> str:
+    if pages < 1:
+        raise ValueError('pages must be positive')
+    lock_teacher(db, user_id)
+    free, monthly, extra, period = sheet_balances(db, user_id)
+    if pages > free + monthly + extra:
+        raise ApiError(429, 'quota_exhausted', 'Недостаточно листов для проверки.')
+    monthly_count = min(pages, monthly)
+    free_count = min(pages - monthly_count, free)
+    extra_count = pages - monthly_count - free_count
+    record = UsageRecord(user_id=user_id, period_id=period.id if period and monthly_count else None,
+                         monthly_pages=monthly_count, free_pages=free_count, extra_pages=extra_count)
+    db.add(record)
+    db.flush()
+    return record.id
 
 
 def reserve_check(db: Session, user_id: str) -> str:
@@ -363,6 +411,10 @@ class SubscriptionView(BaseModel):
     allow_followups: bool = False
     cancel_at_period_end: bool = False
     demonstration: bool
+    sheet_billing: bool = False
+    free_remaining: int = 0
+    monthly_remaining: int = 0
+    extra_remaining: int = 0
 
 
 class EventReceipt(BaseModel):
@@ -371,13 +423,22 @@ class EventReceipt(BaseModel):
     demonstration: bool
 
 
-def describe_subscription(db: Session, user_id: str, provider: PaymentProvider) -> SubscriptionView:
+def describe_subscription(db: Session, user_id: str, provider: PaymentProvider, *, sheets: bool = False, max_pages: int = 100) -> SubscriptionView:
     subscription = db.get(Subscription, user_id)
+    extra_bought = db.scalar(select(func.coalesce(func.sum(SheetTopup.pages), 0)).where(SheetTopup.user_id == user_id)) if sheets else 0
     if subscription is None:
+        if sheets:
+            free, monthly, extra, _ = sheet_balances(db, user_id)
+            return SubscriptionView(status=SubscriptionStatus.INACTIVE, demonstration=provider.demonstration,
+                                    checks_remaining=free + monthly + extra, checks_limit=30 + extra_bought,
+                                    max_pages=max_pages, allow_followups=True, sheet_billing=True,
+                                    free_remaining=free, monthly_remaining=monthly, extra_remaining=extra)
         return SubscriptionView(status=SubscriptionStatus.INACTIVE, demonstration=provider.demonstration)
     current = current_period(db, subscription)
     period = current or latest_period(db, subscription)
     checkout = db.get(Checkout, subscription.checkout_id) if subscription.checkout_id else None
+    if sheets and checkout and checkout.plan_code != 'monthly1000':
+        current = period = None
     if current is not None:
         status = SubscriptionStatus(subscription.status)
     elif subscription.status == SubscriptionStatus.PAST_DUE:
@@ -386,17 +447,19 @@ def describe_subscription(db: Session, user_id: str, provider: PaymentProvider) 
         status = SubscriptionStatus.EXPIRED
     else:
         status = SubscriptionStatus.INACTIVE
+    free, monthly, extra, _ = sheet_balances(db, user_id) if sheets else (0, 0, 0, None)
     return SubscriptionView(
         status=status,
         plan_code=checkout.plan_code if checkout else None,
         period_start=as_utc(period.starts_at) if period else None,
         period_end=as_utc(period.ends_at) if period else None,
-        checks_limit=period.checks_limit if period else 0,
-        checks_remaining=remaining_checks(db, current) if current else 0,
-        max_pages=period.max_pages if period else None,
-        allow_followups=period.allow_followups if period else False,
+        checks_limit=(30 + (current.checks_limit if current else 0) + extra_bought) if sheets else (period.checks_limit if period else 0),
+        checks_remaining=(free + monthly + extra) if sheets else (remaining_checks(db, current) if current else 0),
+        max_pages=max_pages if sheets else (period.max_pages if period else None),
+        allow_followups=True if sheets else (period.allow_followups if period else False),
         cancel_at_period_end=subscription.cancel_at_period_end,
         demonstration=checkout.provider == "fake" if checkout else provider.demonstration,
+        sheet_billing=sheets, free_remaining=free, monthly_remaining=monthly, extra_remaining=extra,
     )
 
 
@@ -409,6 +472,8 @@ def list_plans(request: Request, provider: Provider) -> list[PlanView]:
 
 
 def payment_plans(request: Request, provider: PaymentProvider) -> dict[str, Plan]:
+    if request.app.state.settings.sheet_billing_enabled:
+        return SHEET_PLANS
     config = request.app.state.settings.plans_json
     if not provider.demonstration and config is None:
         raise ApiError(503, "payment_catalog_unavailable", "Тарифы не настроены")
@@ -416,8 +481,8 @@ def payment_plans(request: Request, provider: PaymentProvider) -> dict[str, Plan
 
 
 @router.get("/subscription", response_model=SubscriptionView)
-def get_subscription(db: Db, user_id: CurrentUser, provider: Provider) -> SubscriptionView:
-    return describe_subscription(db, user_id, provider)
+def get_subscription(request: Request, db: Db, user_id: CurrentUser, provider: Provider) -> SubscriptionView:
+    return describe_subscription(db, user_id, provider, sheets=request.app.state.settings.sheet_billing_enabled, max_pages=request.app.state.settings.max_pages)
 
 
 @router.post("/subscription/checkout", status_code=201, response_model=CheckoutView)
@@ -431,11 +496,17 @@ def begin_checkout(
         raise ApiError(503, "payment_catalog_unavailable", "Для тарифа не настроена цена")
     lock_teacher(db, user_id)
     subscription = db.get(Subscription, user_id)
+    if request.app.state.settings.sheet_billing_enabled and plan.code == 'topup140':
+        _, monthly_remaining, _, current = sheet_balances(db, user_id)
+        if subscription is None or subscription.status != SubscriptionStatus.ACTIVE or current is None or monthly_remaining < 1:
+            raise ApiError(403, 'topup_unavailable', 'Докупка доступна при действующей подписке, пока в месячном пакете остаются листы.')
     if subscription is None:
         subscription = Subscription(user_id=user_id)
         db.add(subscription)
     period = latest_period(db, subscription)
-    if period and as_utc(period.ends_at) > utcnow():
+    current_checkout = db.get(Checkout, subscription.checkout_id) if subscription.checkout_id else None
+    legacy_upgrade = request.app.state.settings.sheet_billing_enabled and current_checkout and current_checkout.plan_code != 'monthly1000'
+    if period and as_utc(period.ends_at) > utcnow() and not legacy_upgrade and not (request.app.state.settings.sheet_billing_enabled and plan.code == 'topup140'):
         raise ApiError(409, "subscription_already_paid", "Доступ по подписке уже оплачен")
     pending = db.get(Checkout, subscription.pending_checkout_id) if subscription.pending_checkout_id else None
     if pending and pending.plan_code == plan.code and pending.provider == provider.name:
@@ -468,7 +539,7 @@ def begin_checkout(
 
 
 @router.post("/subscription/cancel", response_model=SubscriptionView)
-def cancel_subscription(db: Db, user_id: CurrentUser, provider: Provider) -> SubscriptionView:
+def cancel_subscription(request: Request, db: Db, user_id: CurrentUser, provider: Provider) -> SubscriptionView:
     lock_teacher(db, user_id)
     subscription = db.get(Subscription, user_id)
     if subscription is None or subscription.checkout_id is None:
@@ -483,7 +554,7 @@ def cancel_subscription(db: Db, user_id: CurrentUser, provider: Provider) -> Sub
         subscription.cancel_at_period_end = True
         db.commit()
         event("subscription_renewal_cancelled", user_id=user_id, checkout_id=checkout.id, provider=provider.name)
-    return describe_subscription(db, user_id, provider)
+    return describe_subscription(db, user_id, provider, sheets=request.app.state.settings.sheet_billing_enabled, max_pages=request.app.state.settings.max_pages)
 
 
 def find_checkout(db: Session, checkout_id: str, provider: PaymentProvider) -> Checkout:
@@ -500,6 +571,13 @@ def apply_payment(
         return False
     if notification.sequence <= checkout.last_event_sequence:
         return False
+
+    if checkout.plan_code == 'topup140' and notification.type == PaymentType.SUCCEEDED:
+        if checkout.id != subscription.pending_checkout_id:
+            return False
+        db.add(SheetTopup(user_id=checkout.user_id, checkout_id=checkout.id, pages=checkout.checks_limit))
+        subscription.pending_checkout_id = None
+        return True
 
     if notification.type == PaymentType.CANCELLED:
         if checkout.id != subscription.checkout_id:
@@ -520,7 +598,9 @@ def apply_payment(
     is_current_checkout = checkout.id == subscription.checkout_id
     if is_current_checkout and subscription.cancel_at_period_end:
         return False
-    if existing_period and start < as_utc(existing_period.ends_at):
+    prior_checkout = db.get(Checkout, subscription.checkout_id) if subscription.checkout_id else None
+    legacy_upgrade = checkout.plan_code == 'monthly1000' and prior_checkout and prior_checkout.plan_code != 'monthly1000'
+    if existing_period and start < as_utc(existing_period.ends_at) and not legacy_upgrade:
         return False
 
     db.add(UsagePeriod(
@@ -652,6 +732,10 @@ def fake_checkout_confirm(checkout_id: str, db: Db, user_id: CurrentUser, provid
     subscription = db.get(Subscription, user_id)
     if subscription is None or subscription.pending_checkout_id != checkout.id:
         raise ApiError(409, "checkout_not_pending", "Оформление подписки уже завершено или заменено")
+    if checkout.plan_code == 'topup140':
+        _, monthly_remaining, _, current = sheet_balances(db, user_id)
+        if subscription.status != SubscriptionStatus.ACTIVE or current is None or monthly_remaining < 1:
+            raise ApiError(409, 'topup_unavailable', 'Докупка доступна при действующей подписке, пока в месячном пакете остаются листы.')
     now = utcnow()
     notification = PaymentNotification(
         id=event_id, checkout_id=checkout.id,

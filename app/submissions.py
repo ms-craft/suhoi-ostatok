@@ -12,12 +12,13 @@ from sqlalchemy.orm import Session
 
 from app.accounts import current_user
 from app.ai import PreliminaryReview, RecognizedTask, ReviewStatus
-from app.billing import entitlement, reserve_check, settle_check
+from app.billing import Entitlement, entitlement, reserve_check, reserve_sheets, settle_check
 from app.core import ApiError, as_utc, event, new_id, request_id, utcnow
 from app.db import get_db
 from app.files import HEIC, HEIF, JPEG, PreparedFile, normalized_jpeg, page_limit, prepare_uploads
 from app.object_lock import lock_object_writer
 from app.submission_models import DetectedTask, ProcessingJob, SourceFile, Submission, SubmissionPage, TeacherEdit
+from app.telegram_access import schedule_submission
 
 router = APIRouter(prefix="/submissions", tags=["Работы"])
 DB = Annotated[Session, Depends(get_db)]
@@ -46,6 +47,7 @@ class SubmissionView(BaseModel):
     error_message: str | None
     page_count: int
     student_reference: str | None
+    class_reference: str | None = None
     created_at: datetime
 
 
@@ -138,8 +140,8 @@ def check_idle(row: Submission) -> None:
         raise ApiError(409, "job_in_progress", "Дождитесь завершения фоновой обработки.")
 
 
-def check_followups(db: Session, user_id: str):
-    limits = entitlement(db, user_id)
+def check_followups(db: Session, user_id: str, *, sheets: bool = False, max_pages: int = 100):
+    limits = Entitlement(max_pages=max_pages, allow_followups=True) if sheets else entitlement(db, user_id)
     if not limits.allow_followups:
         raise ApiError(403, "followups_unavailable", "Тариф не включает уточнения и повторную проверку.")
     return limits
@@ -149,7 +151,7 @@ def processing_message(code: str | None) -> str | None:
     if code is None:
         return None
     if code == "ai_unavailable":
-        return "ИИ-провайдер временно недоступен."
+        return "Не удалось получить ответ ИИ-провайдера. Повторный запуск отправит новый запрос, который может быть платным."
     if code.startswith("ai_"):
         return "ИИ-провайдер не смог подготовить пригодный результат."
     if code == "storage_unavailable":
@@ -167,6 +169,7 @@ def submission_data(row: Submission) -> dict:
         "error_message": processing_message(row.error_code),
         "page_count": row.page_count,
         "student_reference": row.student_reference,
+        "class_reference": row.class_reference,
         "created_at": as_utc(row.created_at),
     }
 
@@ -303,6 +306,7 @@ def upload(
     test_subject: Annotated[str | None, Form(max_length=100)] = None,
     test_subject_category: Annotated[Literal['stem', 'humanities'] | None, Form()] = None,
     student_reference: Annotated[str | None, Form(max_length=120)] = None,
+    class_reference: Annotated[str | None, Form(max_length=100, pattern=r'^[A-Za-z0-9_-]+$')] = None,
 ):
     state = request.app.state
     test_subject = test_subject.strip() if test_subject else None
@@ -323,13 +327,15 @@ def upload(
         except (ValueError, TypeError):
             raise ApiError(422, "invalid_test", "Проверьте задания и ответы работы.") from None
     prepared = prepare_uploads(files or [], state.settings, max_pages=state.settings.max_pages)
-    reservation = reserve_check(db, user_id)
-    limits = entitlement(db, user_id)
+    sheets = state.settings.sheet_billing_enabled
+    page_count = sum(len(file.pages) for file in prepared)
+    reservation = reserve_sheets(db, user_id, page_count) if sheets else reserve_check(db, user_id)
+    limits = Entitlement(max_pages=state.settings.max_pages, allow_followups=True) if sheets else entitlement(db, user_id)
     if sum(len(file.pages) for file in prepared) > limits.max_pages:
         raise page_limit()
 
     job_id = new_id()
-    row = Submission(id=new_id(), user_id=user_id, latest_job_id=job_id, page_count=0,
+    row = Submission(id=new_id(), user_id=user_id, latest_job_id=job_id, page_count=0, class_reference=class_reference,
                      student_reference=student_reference.strip() or None if student_reference else None)
     db.add(row)
     db.flush()
@@ -364,6 +370,8 @@ def get_submission(submission_id: UUID, db: DB, user_id: Owner):
 def label_submission(submission_id: UUID, body: SubmissionLabel, db: DB, user_id: Owner):
     row = owned(db, submission_id, user_id, lock=True)
     row.student_reference = body.student_reference or None
+    if row.first_completed_at is not None:
+        schedule_submission(db, row)
     db.commit()
     return submission_data(row)
 
@@ -445,12 +453,18 @@ def clarify(
     prepared = prepare_uploads(files or [], state.settings, max_pages=state.settings.max_pages, required=False)
     row = owned(db, submission_id, user_id, lock=True)
     check_idle(row)
-    limits = check_followups(db, user_id)
+    sheets = state.settings.sheet_billing_enabled
+    limits = check_followups(db, user_id, sheets=sheets, max_pages=state.settings.max_pages)
     if row.page_count + sum(len(file.pages) for file in prepared) > min(
         limits.max_pages, state.settings.max_pages
     ):
         raise page_limit()
-    reservation = reserve_check(db, user_id) if row.first_completed_at is None else None
+    added_pages = sum(len(file.pages) for file in prepared)
+    if sheets:
+        pages = max(0, row.page_count + added_pages - (row.accounted_pages or 0))
+        reservation = reserve_sheets(db, user_id, pages) if pages else None
+    else:
+        reservation = reserve_check(db, user_id) if row.first_completed_at is None else None
     job = enqueue(db, row, "clarification", clarification=text, reservation_id=reservation)
     save_uploads(db, state, row, prepared)
     event("submission_clarified", submission_id=row.id, user_id=user_id, job_id=job.id,
@@ -465,11 +479,16 @@ def retry(request: Request, submission_id: UUID, db: DB, user_id: Owner):
     if row.status != "failed":
         raise ApiError(409, "job_not_failed", "Повторный запуск доступен для завершившейся с ошибкой задачи.")
     previous = db.get(ProcessingJob, row.latest_job_id)
+    sheets = request.app.state.settings.sheet_billing_enabled
     if previous.kind != "initial":
-        check_followups(db, user_id)
-    reservation = reserve_check(db, user_id) if row.first_completed_at is None else None
+        check_followups(db, user_id, sheets=sheets)
+    if sheets:
+        pages = max(0, row.page_count - (row.accounted_pages or 0)) if previous.kind != 'recheck' else 0
+        reservation = reserve_sheets(db, user_id, pages) if pages else None
+    else:
+        reservation = reserve_check(db, user_id) if row.first_completed_at is None else None
     if previous.kind != "recheck" and row.page_count > min(
-        entitlement(db, user_id).max_pages, request.app.state.settings.max_pages,
+        (request.app.state.settings.max_pages if sheets else entitlement(db, user_id).max_pages), request.app.state.settings.max_pages,
     ):
         raise page_limit()
     job = enqueue(db, row, previous.kind, task_id=previous.task_id, reservation_id=reservation)
@@ -490,6 +509,7 @@ def correct(submission_id: UUID, task_id: UUID, body: Correction, db: DB, user_i
         **(task.teacher or {}), **changes, "confirmed_at": None, "final_status": None,
     }
     db.add(TeacherEdit(task_id=task.id, kind="correction", snapshot=task.teacher))
+    schedule_submission(db, row)
     db.commit()
     return task_data(task)
 
@@ -499,7 +519,7 @@ def recheck(request: Request, submission_id: UUID, task_id: UUID, db: DB, user_i
     row = owned(db, submission_id, user_id, lock=True)
     check_idle(row)
     task = task_for(db, row, task_id)
-    check_followups(db, user_id)
+    check_followups(db, user_id, sheets=request.app.state.settings.sheet_billing_enabled)
     job = enqueue(db, row, "recheck", task_id=task.id)
     db.commit()
     notify(request.app.state, job.id, row.id, user_id)
@@ -520,6 +540,7 @@ def confirm(submission_id: UUID, task_id: UUID, db: DB, user_id: Owner):
         db.add(TeacherEdit(task_id=task.id, kind="confirmation", snapshot={
             **task.teacher, "recognition": task.recognition, "preliminary": task.preliminary,
         }))
+        schedule_submission(db, row)
         db.commit()
     return task_data(task)
 

@@ -49,21 +49,23 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-3.8-flash"
     gemini_recognition_model: str = "gemini-3.5-flash-lite"
     gemini_humanities_model: str = "gemini-3.8-flash"
+    telegram_bot_token: SecretStr | None = None
     payment_provider: Literal["fake"] = "fake"
     fake_payment_secret: SecretStr | None = None
     plans_json: str | None = None
+    sheet_billing_enabled: bool = True
     auth_token_ttl_seconds: int = Field(default=86400, ge=60, le=604800)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
     max_file_bytes: int = Field(default=12 * 1024 * 1024, ge=1, le=30 * 1024 * 1024)
     max_request_bytes: int = Field(default=32 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
-    max_pages: int = Field(default=10, ge=1, le=20)
-    max_image_pixels: int = Field(default=20_000_000, ge=1, le=40_000_000)
+    max_pages: int = Field(default=100, ge=1, le=100)
+    max_image_pixels: int = Field(default=64_000_000, ge=1, le=80_000_000)
     page_image_edge: int = Field(default=2000, ge=500, le=3000)
     worker_poll_seconds: int = Field(default=3, ge=1, le=30)
     worker_heartbeat_path: Path | None = None
     job_lease_seconds: int = Field(default=180, ge=15, le=900)
-    max_attempts: int = Field(default=3, ge=1, le=8)
+    max_attempts: int = Field(default=1, ge=1, le=8)
     retry_delay_seconds: int = Field(default=10, ge=0, le=300)
 
     @field_validator("pilot_allowed_emails")

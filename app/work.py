@@ -7,17 +7,18 @@ from datetime import timedelta
 from threading import Event, Thread
 from time import monotonic
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 
 from app.ai import (
     AIError, PageInput, PreliminaryReview, RecognizedTask, validate_recognition, validate_reviews,
 )
-from app.billing import settle_check
+from app.billing import UsageRecord, settle_check
 from app.core import as_utc, event, job_context, new_id, utcnow, worker_heartbeat
 from app.submission_models import (
     DetectedTask, ProcessingJob, SourceFile, Submission, SubmissionPage, TaskAnalysis, TeacherEdit,
 )
 from app.submissions import BUSY, lock_submission
+from app.telegram_access import schedule_submission
 
 
 class LeaseLost(Exception):
@@ -230,6 +231,14 @@ def _match_tasks(recognition: list[RecognizedTask], previous: list[InputTask]) -
     return matched
 
 
+def _submission_has_one_task(state, claim: Claim) -> bool:
+    with state.session_factory() as db:
+        count = db.scalar(select(func.count()).select_from(DetectedTask).where(
+            DetectedTask.submission_id == claim.submission_id
+        ))
+    return count == 1
+
+
 def _analyze(state, claim: Claim) -> list[Analysis]:
     pages, existing, clarification, references, subject, subject_category = _load_inputs(state, claim)
     provider = state.ai_provider
@@ -262,10 +271,17 @@ def _analyze(state, claim: Claim) -> list[Analysis]:
         reviews = []
         numbers = Counter(task.number for task in review_inputs if task.number)
         for task in review_inputs:
-            if not task.number or not task.number.isdecimal() or numbers[task.number] != 1:
+            single_unnumbered = (
+                not task.number and len(references) == 1 and len(review_inputs) == 1
+                and (claim.kind != "recheck" or _submission_has_one_task(state, claim))
+            )
+            if single_unnumbered:
+                number = 1
+            elif not task.number or not task.number.isdecimal() or numbers[task.number] != 1:
                 reviews.append(PreliminaryReview(status="needs_review", explanation="Не удалось однозначно сопоставить задание с выбранной работой.", uncertainty="Проверьте номер задания."))
                 continue
-            number = int(task.number)
+            else:
+                number = int(task.number)
             if not 1 <= number <= len(references):
                 reviews.append(PreliminaryReview(status="needs_review", explanation="Для этого номера нет задания в выбранной работе.", uncertainty="Проверьте номер задания."))
                 continue
@@ -274,14 +290,21 @@ def _analyze(state, claim: Claim) -> list[Analysis]:
                 reviews.append(PreliminaryReview(status="needs_review", explanation="Эталон задания недоступен.", uncertainty="Проверьте работу."))
                 continue
             expected = reference['answer']
-            if task.ambiguity or task.answer_state != 'present' or not task.answer:
+            if task.answer_state != 'present' or not task.answer:
                 review = PreliminaryReview(status="needs_review", explanation="Ответ не удалось однозначно распознать.", uncertainty="Сверьте ответ с фотографией.")
-            elif normalize_answer(task.answer) == normalize_answer(expected):
+            elif not task.ambiguity and normalize_answer(task.answer) == normalize_answer(expected):
                 review = PreliminaryReview(status="correct", explanation="Распознанный ответ совпадает с ответом учителя в работе.")
             elif hasattr(provider, 'review_reference'):
                 review = provider.review_reference(task, reference, clarification)
             else:
                 review = PreliminaryReview(status="needs_review", explanation="Ответ отличается от ответа учителя.", uncertainty="Сверьте ответ вручную.")
+            if task.ambiguity and task.answer_state == 'present' and task.answer:
+                # An uncertain fragment must not hide a separately identified error.
+                # A positive result still needs confirmation when the OCR is uncertain.
+                review = review.model_copy(update={
+                    "status": "needs_review" if review.status == "correct" else review.status,
+                    "uncertainty": review.uncertainty or task.ambiguity,
+                })
             reviews.append(review.model_copy(update={"expected_answer": expected, "expected_answer_source": "teacher_test"}))
     _stage(state, claim, "validation")
     return Analyses([
@@ -333,6 +356,12 @@ def _persist(state, claim: Claim, analyses: list[Analysis]) -> None:
             ))
 
         if job.reservation_id:
+            reservation = db.get(UsageRecord, job.reservation_id)
+            if reservation:
+                charged_pages = reservation.free_pages + reservation.monthly_pages + reservation.extra_pages
+                row.accounted_pages = min(row.page_count, (row.accounted_pages or 0) + charged_pages)
+                if not state.settings.sheet_billing_enabled or reservation.user_id is None:
+                    row.accounted_pages = row.page_count
             settle_check(db, job.reservation_id, success=True)
         now = utcnow()
         row.first_completed_at = row.first_completed_at or now
@@ -341,6 +370,7 @@ def _persist(state, claim: Claim, analyses: list[Analysis]) -> None:
         job.provider, job.demonstration = provider.name, provider.demonstration
         job.finished_at = now
         job.lease_token = job.lease_until = None
+        schedule_submission(db, row)
 
 
 def _fail_final(db, row: Submission, job: ProcessingJob, code: str) -> None:

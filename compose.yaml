@@ -108,6 +108,17 @@ services:
     stop_grace_period: 60s
     restart: unless-stopped
 
+  telegram-bot:
+    <<: *app
+    profiles: [telegram]
+    command: ["python", "-m", "app.telegram_bot"]
+    healthcheck:
+      disable: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
   test:
     profiles: [test]
     build:
