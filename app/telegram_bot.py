@@ -1,5 +1,6 @@
 """Student Telegram bot. Run one instance: python -m app.telegram_bot."""
 import hashlib
+import html
 import json
 import logging
 import signal
@@ -15,9 +16,10 @@ from app.config import Settings
 from app.core import configure_logging, event, utcnow
 from app.db import make_session_factory
 from app.submission_models import DetectedTask, Submission, TaskAnalysis
-from app.telegram_access import name_key, schedule_submission, valid_name
+from app.telegram_access import fully_confirmed, name_key, schedule_submission, valid_name
 from app.telegram_models import TelegramBinding, TelegramClass, TelegramDelivery
 from app.telegram_notifier import format_result
+from app.workspace import TeacherWorkspace
 
 logging.getLogger('httpx').setLevel(logging.WARNING)
 API = 'https://api.telegram.org/bot{token}/{method}'
@@ -25,6 +27,123 @@ HELP = ('Здравствуйте! Чтобы получать результа�
         '/link КОД_КЛАССА Фамилия Имя\n\n'
         'Код выдаёт учитель. После регистрации результаты будут приходить автоматически.\n'
         '/status — проверить регистрацию\n/unlink — отключить все привязки')
+PAGE_SIZE = 5
+
+
+def _work_title(db, row):
+    workspace = db.get(TeacherWorkspace, row.user_id)
+    data = workspace.data if workspace and isinstance(workspace.data, dict) else {}
+    link = (data.get('links') or {}).get(row.id) or {}
+    test_id = link.get('testId') if isinstance(link, dict) else None
+    return next((test.get('name') for test in data.get('tests', [])
+                 if isinstance(test, dict) and test.get('id') == test_id), None) or 'Работа'
+
+
+def _student_works(db, chat_id):
+    bindings = db.scalars(select(TelegramBinding).where(TelegramBinding.chat_id == chat_id)).all()
+    works = []
+    for binding in bindings:
+        cls = db.get(TelegramClass, binding.class_id)
+        if not cls:
+            continue
+        rows = db.scalars(select(Submission).where(Submission.user_id == cls.user_id,
+                          Submission.class_reference == cls.external_id,
+                          Submission.delete_requested_at.is_(None), Submission.first_completed_at.is_not(None))
+                          .order_by(Submission.created_at.desc())).all()
+        for row in rows:
+            if name_key(row.student_reference) == binding.name_key and fully_confirmed(db, row):
+                works.append((row, cls, binding, _work_title(db, row)))
+    works.sort(key=lambda item: (item[0].created_at, item[0].id), reverse=True)
+    return bindings, works
+
+
+def _task_data(db, tasks):
+    latest_inputs = {}
+    if tasks:
+        analyses = db.scalars(select(TaskAnalysis).where(TaskAnalysis.task_id.in_([task.id for task in tasks]))
+                              .order_by(TaskAnalysis.created_at.desc(), TaskAnalysis.id.desc())).all()
+        for analysis in analyses:
+            latest_inputs.setdefault(analysis.task_id, analysis.review_input)
+    result = []
+    for task in tasks:
+        teacher = task.teacher or {}
+        prior = latest_inputs.get(task.id)
+        stale = any(field in teacher and (prior is None or (teacher[field] or None) != (prior.get(field) or None))
+                    for field in ('number', 'condition', 'answer'))
+        result.append({'original_recognition': task.original_recognition, 'recognition': task.recognition,
+                       'preliminary': task.preliminary, 'teacher': task.teacher, 'review_stale': stale})
+    return result
+
+
+def show_profile(token, chat_id, db_factory, page=0, message_id=None):
+    with db_factory() as db:
+        bindings, works = _student_works(db, chat_id)
+        if not bindings:
+            reply(token, chat_id, HELP)
+            return
+        page = min(max(0, page), max(0, (len(works) - 1) // PAGE_SIZE))
+        classes = [db.get(TelegramClass, binding.class_id) for binding in bindings]
+        names = ', '.join(dict.fromkeys(binding.name for binding in bindings))
+        class_names = ', '.join(dict.fromkeys(cls.name for cls in classes if cls))
+        title = f'<b>Профиль ученика</b>\n{html.escape(names)}\nКласс: {html.escape(class_names)}'
+        title += f'\n\n<b>Мои работы · {len(works)}</b>' if works else '\n\nПодтверждённых работ пока нет.'
+        keyboard = []
+        for row, cls, binding, name in works[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]:
+            date = row.created_at.strftime('%d.%m.%Y')
+            label = f'{name[:32]} · {cls.name[:12]} · {date}'
+            keyboard.append([{'text': label, 'callback_data': f'work:{row.id}:{page}'}])
+        pages = max(1, (len(works) + PAGE_SIZE - 1) // PAGE_SIZE)
+        nav = []
+        if page > 0:
+            nav.append({'text': '← Новее', 'callback_data': f'page:{page-1}'})
+        if pages > 1:
+            nav.append({'text': f'{page+1} / {pages}', 'callback_data': 'noop'})
+        if page + 1 < pages:
+            nav.append({'text': 'Старее →', 'callback_data': f'page:{page+1}'})
+        if nav:
+            keyboard.append(nav)
+    payload = {'chat_id': chat_id, 'text': title, 'parse_mode': 'HTML',
+               'reply_markup': {'inline_keyboard': keyboard}}
+    if message_id is not None:
+        payload['message_id'] = message_id
+    call_telegram(token, 'editMessageText' if message_id is not None else 'sendMessage', **payload)
+
+
+def dispatch_callback(token, callback, db_factory):
+    sender = callback.get('from') or {}
+    message = callback.get('message') or {}
+    chat = message.get('chat') or {}
+    callback_id = callback.get('id')
+    if chat.get('type') != 'private' or not isinstance(chat.get('id'), int) or chat['id'] != sender.get('id'):
+        return
+    chat_id = chat['id']
+    if callback_id:
+        call_telegram(token, 'answerCallbackQuery', callback_query_id=callback_id)
+    data = callback.get('data') or ''
+    if data.startswith('page:') and data[5:].isdigit():
+        show_profile(token, chat_id, db_factory, int(data[5:]), message.get('message_id'))
+    elif data.startswith('work:'):
+        parts = data.split(':')
+        if len(parts) != 3 or not parts[2].isdigit():
+            return
+        with db_factory() as db:
+            _, works = _student_works(db, chat_id)
+            match = next((entry for entry in works if entry[0].id == parts[1]), None)
+            if match is None:
+                reply(token, chat_id, 'Работа недоступна. Обновите профиль командой /start.')
+                return
+            row, cls, binding, name = match
+            tasks = db.scalars(select(DetectedTask).where(DetectedTask.submission_id == row.id)
+                               .order_by(DetectedTask.position)).all()
+            details = _task_data(db, tasks)
+            submission = {'created_at': row.created_at.isoformat(), 'title': name, 'class_name': cls.name}
+            messages = format_result(submission, details)
+        for index, text in enumerate(messages):
+            keyboard = {'inline_keyboard': [[{'text': '← Мои работы', 'callback_data': f'page:{parts[2]}'}]]} if index == len(messages)-1 else None
+            payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
+            if keyboard:
+                payload['reply_markup'] = keyboard
+            call_telegram(token, 'sendMessage', **payload)
 
 
 class TelegramError(Exception):
@@ -97,11 +216,16 @@ def dispatch(token: str, message: dict, db_factory) -> None:
     if not text:
         return
     command = text.split(None, 1)[0].split('@')[0].lower()
-    if command in {'/start', '/help'}:
+    if command == '/start':
+        show_profile(token, chat_id, db_factory)
+    elif command == '/help':
         reply(token, chat_id, HELP)
     elif command == '/link':
         parts = text.split(None, 2)
-        reply(token, chat_id, register(db_factory, parts[1], parts[2], chat_id) if len(parts) == 3 else HELP)
+        result = register(db_factory, parts[1], parts[2], chat_id) if len(parts) == 3 else HELP
+        reply(token, chat_id, result)
+        if 'завершена' in result:
+            show_profile(token, chat_id, db_factory)
     elif command == '/status':
         with db_factory() as db:
             bindings = db.execute(select(TelegramClass.name, TelegramBinding.name).join(
@@ -138,26 +262,13 @@ def _claim_delivery(db_factory):
         if row.first_completed_at is None:
             item.status = 'failed'
             return None
+        if not fully_confirmed(db, row):
+            db.delete(item)
+            return None
         tasks = db.scalars(select(DetectedTask).where(DetectedTask.submission_id == row.id)
                            .order_by(DetectedTask.position)).all()
-        latest_inputs = {}
-        if tasks:
-            analyses = db.scalars(select(TaskAnalysis).where(TaskAnalysis.task_id.in_([task.id for task in tasks]))
-                                  .order_by(TaskAnalysis.created_at.desc(), TaskAnalysis.id.desc())).all()
-            for analysis in analyses:
-                latest_inputs.setdefault(analysis.task_id, analysis.review_input)
-        def review_is_stale(task):
-            teacher = task.teacher or {}
-            prior = latest_inputs.get(task.id)
-            for field in ('condition', 'answer'):
-                if field in teacher:
-                    if prior is None or (teacher[field] or None) != (prior.get(field) or None):
-                        return True
-            return False
-        data = [{'original_recognition': task.original_recognition, 'recognition': task.recognition,
-                 'preliminary': task.preliminary, 'teacher': task.teacher, 'review_stale': review_is_stale(task)}
-                for task in tasks]
-        submission = {'created_at': row.created_at.isoformat()}
+        data = _task_data(db, tasks)
+        submission = {'id': row.id, 'title': _work_title(db, row), 'created_at': row.created_at.isoformat()}
         digest = hashlib.sha256(json.dumps([submission, data], ensure_ascii=False, sort_keys=True,
                                            separators=(',', ':')).encode()).hexdigest()
         if item.inflight_digest != digest:
@@ -177,15 +288,21 @@ def deliver_pending(token: str, db_factory, *, limit: int = 20) -> None:
         success = False
         try:
             if digest != previous_digest:
-                for index, message in enumerate(format_result(submission, tasks)):
+                notice = (f'<b>Работа проверена</b>\n{html.escape(submission["title"])}\n\n'
+                          'Учитель подтвердил результат. Откройте разбор ниже.')
+                for index, message in enumerate([notice]):
                     if index < sent_parts:
                         continue
                     if index > sent_parts:
                         sleep(1.05)
                     with db_factory() as db:
-                        if db.get(TelegramBinding, binding_id) is None or db.get(TelegramDelivery, item_id) is None:
+                        current_row = db.get(Submission, submission['id'])
+                        if (db.get(TelegramBinding, binding_id) is None or db.get(TelegramDelivery, item_id) is None
+                                or current_row is None or not fully_confirmed(db, current_row)):
                             return
-                    call_telegram(token, 'sendMessage', chat_id=chat_id, text=message, parse_mode='HTML')
+                    call_telegram(token, 'sendMessage', chat_id=chat_id, text=message, parse_mode='HTML',
+                                  reply_markup={'inline_keyboard': [[{'text': 'Открыть разбор',
+                                      'callback_data': f'work:{submission["id"]}:0'}]]})
                     with db_factory.begin() as db:
                         current = db.scalar(select(TelegramDelivery).where(TelegramDelivery.id == item_id).with_for_update())
                         if current is None or current.status != 'pending' or current.attempts != attempt or current.inflight_digest != digest:
@@ -221,7 +338,7 @@ def run_polling(token: str, db_factory) -> None:
     while not stopped.is_set():
         try:
             deliver_pending(token, db_factory)
-            payload = {'timeout': 5, 'allowed_updates': ['message']}
+            payload = {'timeout': 5, 'allowed_updates': ['message', 'callback_query']}
             if offset is not None:
                 payload['offset'] = offset
             updates = call_telegram(token, 'getUpdates', http_timeout=15, **payload).get('result', [])
@@ -232,6 +349,8 @@ def run_polling(token: str, db_factory) -> None:
                 try:
                     if update.get('message'):
                         dispatch(token, update['message'], db_factory)
+                    elif update.get('callback_query'):
+                        dispatch_callback(token, update['callback_query'], db_factory)
                 except Exception:
                     event('telegram_command_failed', component='telegram', level='WARNING', error_code='command_failed')
                     stopped.wait(5)

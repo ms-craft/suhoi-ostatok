@@ -58,3 +58,21 @@ def test_import_timeout_does_not_resend(build_harness):
     assert response.status_code == 503
     assert provider.calls == 1
     assert 'платный запрос' in response.json()['error']['message']
+
+
+@pytest.mark.parametrize('body', [
+    {'questions': ['Укажите число электронов', 'Найдите изотопы']},
+    ['Укажите число электронов', 'Найдите изотопы'],
+    {'questions': [{'question': 'Укажите число электронов'}, 'Найдите изотопы']},
+])
+def test_question_extraction_accepts_list_of_strings(monkeypatch, body):
+    calls = []
+    def post(url, **kwargs):
+        calls.append(1)
+        return httpx.Response(200, json={'choices': [{'finish_reason': 'stop', 'message': {
+            'content': json.dumps(body, ensure_ascii=False)}}]})
+    monkeypatch.setattr('app.ai.gemini.httpx.post', post)
+    provider = GeminiAIProvider('key', api_base='https://example.test/v1')
+    assert provider.extract_questions(PageInput(1, b'photo', 'image/jpeg')) == [
+        'Укажите число электронов', 'Найдите изотопы']
+    assert len(calls) == 1

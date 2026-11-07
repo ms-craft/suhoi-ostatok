@@ -47,8 +47,10 @@ def format_result(submission: dict, tasks: list[dict]) -> list[str]:
         date = date.astimezone(ZoneInfo('Europe/Minsk')).strftime('%d.%m.%Y') if date else ''
     except (ValueError, TypeError, OverflowError):
         date = ''
-    title = 'Результат проверки' + (f' от {date}' if date else '')
-    messages = [f'<b>{html.escape(title)}</b>\nПредварительный результат, если учитель не подтвердил его.']
+    title = submission.get('title') or 'Работа'
+    meta = ' · '.join(filter(None, [submission.get('class_name'), date]))
+    messages = [f'<b>{html.escape(str(title))}</b>' + (f'\n{html.escape(meta)}' if meta else '') +
+                '\n\nРазбор работы · подтверждён учителем']
     if not tasks:
         messages.append('Задания не распознаны. Обратитесь к учителю.')
     for index, task in enumerate(tasks, 1):
@@ -65,9 +67,9 @@ def format_result(submission: dict, tasks: list[dict]) -> list[str]:
         status = (teacher.get('final_status') if confirmed else teacher.get('status')) or review.get('status', 'needs_review')
         if stale and not confirmed:
             status = 'needs_review'
-        number = str(rec.get('number') or index)
+        number = str((teacher.get('number') if 'number' in teacher else rec.get('number')) or index)
         label = STATUS_LABELS.get(status, 'Нужна проверка')
-        messages.append(f'<b>Задание {html.escape(number)}</b> · {html.escape(label)}\n' +
+        messages.append(f'━━━━━━━━━━━━━━\n<b>Задание {html.escape(number)}</b> · {html.escape(label)}\n' +
                         ('Подтверждено учителем' if confirmed else 'Предварительный результат'))
         condition = teacher.get('condition') if 'condition' in teacher else rec.get('condition')
         answer = teacher.get('answer') if 'answer' in teacher else rec.get('answer')

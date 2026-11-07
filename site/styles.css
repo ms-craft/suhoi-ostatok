@@ -202,7 +202,7 @@ input, textarea, select { font-size: 16px; }
 .question-order-hint { margin: 0 0 12px; color: var(--ink-2); font-size: 13px; }
 .question-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
 .question-order { display: flex; gap: 6px; }
-.question-move { width: 40px; height: 40px; border: 1px solid var(--line-2); border-radius: 10px; background: var(--card); color: var(--ink-2); font-size: 20px; line-height: 1; }
+.question-move { display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border: 1px solid var(--line-2); border-radius: 10px; background: var(--card); color: var(--ink-2); font-size: 20px; line-height: 1; }
 .question-move:disabled { opacity: .35; cursor: default; }
 .question-move:not(:disabled):active { background: var(--card-2); }
 .question-move:focus-visible { outline: 2px solid var(--terra); outline-offset: 2px; }
@@ -577,6 +577,10 @@ input, textarea, select { font-size: 16px; }
   border: 1px solid var(--line-2); border-radius: var(--r-xs); background: var(--card);
 }
 .form-field textarea { resize: vertical; }
+.math-preview { display: grid; gap: 6px; min-width: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-xs); background: var(--card-2); }
+.math-preview-label { color: var(--ink-3); font-size: 12px; font-weight: 500; }
+.math-preview-content { min-width: 0; overflow-x: auto; color: var(--ink); font-weight: 400; white-space: pre-wrap; overflow-wrap: anywhere; }
+.math-preview-content .katex-display { margin: .5em 0; }
 .form-field input[type="file"] {
   width: 100%; min-width: 0; min-height: 48px; padding: 4px;
   border: 1px solid var(--line-2); border-radius: var(--r-xs);

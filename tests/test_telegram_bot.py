@@ -1,5 +1,5 @@
 from app.ai import FakeAIProvider, PreliminaryReview, RecognizedTask
-from app.telegram_bot import deliver_pending, dispatch, register
+from app.telegram_bot import deliver_pending, dispatch, dispatch_callback, register
 from tests.support import photograph
 
 
@@ -85,6 +85,7 @@ def test_existing_work_can_be_attached_only_by_its_owner(build_harness, monkeypa
     assert sent == []
     own_code = class_code(harness, owner, 'sameid', submission_ids=[submission['id']])
     assert 'завершена' in register(harness.app.state.session_factory, own_code, 'Иванов Иван', 101)
+    assert harness.client.post(f"/v1/submissions/{submission['id']}/confirm", headers=owner).status_code == 200
     deliver_pending('test', harness.app.state.session_factory)
     assert sent and all(item['chat_id'] == 101 for item in sent)
 
@@ -109,13 +110,18 @@ def test_checked_work_and_teacher_edit_delivered_only_to_matching_student(build_
     submission = response.json()
     harness.process(submission['job_id'])
     status_path = f"/v1/telegram/submissions/{submission['id']}/delivery"
-    assert harness.client.get(status_path, headers=auth).json()['status'] == 'pending'
+    assert harness.client.get(status_path, headers=auth).json()['status'] == 'awaiting_confirmation'
     sent = []
     monkeypatch.setattr('app.telegram_bot.call_telegram', lambda token, method, **kwargs: sent.append(kwargs) or {'ok': True})
     deliver_pending('test', factory)
+    assert sent == []
+    assert harness.client.post(f"/v1/submissions/{submission['id']}/confirm", headers=auth).status_code == 200
+    deliver_pending('test', factory)
     assert harness.client.get(status_path, headers=auth).json()['status'] == 'sent'
     assert sent and all(item['chat_id'] == 101 for item in sent)
-    text = '\n'.join(item['text'] for item in sent)
+    dispatch_callback('test', {'id': 'cb', 'from': {'id': 101}, 'message': {'chat': {'id': 101, 'type': 'private'}},
+                               'data': f"work:{submission['id']}:0"}, factory)
+    text = '\n'.join(item.get('text', '') for item in sent)
     assert '<b>Ваш ответ</b>\nкамар' in text
     assert '<b>Ответ учителя</b>\nкомар' in text
     assert '<blockquote>камар</blockquote>' in text
@@ -126,16 +132,21 @@ def test_checked_work_and_teacher_edit_delivered_only_to_matching_student(build_
     result = harness.client.patch(f"/v1/submissions/{submission['id']}/tasks/{task_id}", headers=auth,
                                   json={'answer': 'комар', 'explanation': 'Исправлено'})
     assert result.status_code == 200
-    assert harness.client.get(status_path, headers=auth).json()['status'] == 'pending'
+    assert harness.client.get(status_path, headers=auth).json()['status'] == 'awaiting_confirmation'
     deliver_pending('test', factory)
-    text = '\n'.join(item['text'] for item in sent[old_count:])
+    assert len(sent) == old_count
+    assert harness.client.post(f"/v1/submissions/{submission['id']}/confirm", headers=auth).status_code == 200
+    deliver_pending('test', factory)
+    dispatch_callback('test', {'id': 'cb', 'from': {'id': 101}, 'message': {'chat': {'id': 101, 'type': 'private'}},
+                               'data': f"work:{submission['id']}:0"}, factory)
+    text = '\n'.join(item.get('text', '') for item in sent[old_count:])
     assert '<b>Ваш ответ</b>\nкомар' in text
     assert '<b>Первоначальное распознавание</b>\nкамар' in text
     assert '<b>Ответ учителя</b>\nкомар' in text
     assert 'Исправлено' in text
 
 
-def test_failed_multi_message_delivery_resumes_after_last_success(build_harness, monkeypatch):
+def test_failed_notification_is_retried(build_harness, monkeypatch):
     from app.telegram_bot import TelegramError
     from app.telegram_models import TelegramDelivery
     from app.core import utcnow
@@ -151,26 +162,25 @@ def test_failed_multi_message_delivery_resumes_after_last_success(build_harness,
     response = harness.client.post('/v1/submissions', headers=auth, files=[photograph()],
                                    data={'class_reference': 'class1', 'student_reference': 'Иван Иванов'})
     harness.process(response.json()['job_id'])
+    assert harness.client.post(f"/v1/submissions/{response.json()['id']}/confirm", headers=auth).status_code == 200
     sent = []
     monkeypatch.setattr('app.telegram_bot.sleep', lambda _: None)
     failure = [True]
     def send(token, method, **kwargs):
-        if len(sent) == 1 and failure[0]:
+        if failure[0]:
             failure[0] = False
             raise TelegramError('temporary')
         sent.append(kwargs['text'])
         return {'ok': True}
     monkeypatch.setattr('app.telegram_bot.call_telegram', send)
     deliver_pending('test', factory)
-    assert len(sent) == 1
-    first_message = sent[0]
+    assert len(sent) == 0
     with factory.begin() as db:
         delivery = db.scalar(select(TelegramDelivery))
-        assert delivery.sent_parts == 1
+        assert delivery.sent_parts == 0
         delivery.next_attempt_at = utcnow()
     deliver_pending('test', factory)
-    assert len(sent) > 1
-    assert sent.count(first_message) == 1
+    assert len(sent) == 1
     with factory() as db:
         assert db.scalar(select(TelegramDelivery)).status == 'sent'
 
@@ -200,6 +210,7 @@ def test_delivery_retry_is_owner_scoped_and_does_not_recheck_ai(build_harness):
                                    data={'class_reference': 'class1', 'student_reference': 'Иван Иванов'})
     submission = response.json()
     harness.process(submission['job_id'])
+    assert harness.client.post(f"/v1/submissions/{submission['id']}/confirm", headers=auth).status_code == 200
     with harness.app.state.session_factory.begin() as db:
         delivery = db.scalar(select(TelegramDelivery))
         delivery.status, delivery.attempts = 'failed', 5
@@ -208,3 +219,112 @@ def test_delivery_retry_is_owner_scoped_and_does_not_recheck_ai(build_harness):
     assert harness.client.post(path, headers=auth).status_code == 200
     assert harness.client.get(f"/v1/telegram/submissions/{submission['id']}/delivery", headers=auth).json()['status'] == 'pending'
     assert harness.submission(auth, submission['id'])['job_id'] == submission['job_id']
+
+
+def test_profile_requires_all_tasks_confirmed_and_checks_callback_owner(build_harness, monkeypatch):
+    class Provider(FakeAIProvider):
+        def recognize(self, pages, clarification):
+            return [RecognizedTask(page_number=1, number=str(i), answer='2', answer_state='present') for i in (1, 2)]
+    harness = build_harness(ai_provider=Provider(), sheet_billing_enabled=True)
+    auth, _ = harness.register()
+    code = class_code(harness, auth, 'class1')
+    factory = harness.app.state.session_factory
+    register(factory, code, 'Иванов Иван', 101)
+    register(factory, code, 'Петров Пётр', 202)
+    response = harness.client.post('/v1/submissions', headers=auth, files=[photograph()],
+                                   data={'class_reference': 'class1', 'student_reference': 'Иван Иванов'})
+    submission = response.json()
+    harness.process(submission['job_id'])
+    tasks = harness.results(auth, submission['id'])['tasks']
+    assert harness.client.post(f"/v1/submissions/{submission['id']}/tasks/{tasks[0]['id']}/confirm", headers=auth).status_code == 200
+    calls = []
+    monkeypatch.setattr('app.telegram_bot.call_telegram', lambda token, method, **kw: calls.append((method, kw)) or {'ok': True})
+    dispatch('test', {'chat': {'id': 101, 'type': 'private'}, 'from': {'id': 101}, 'text': '/start'}, factory)
+    assert 'пока нет' in calls[-1][1]['text']
+    deliver_pending('test', factory)
+    assert len(calls) == 1
+    assert harness.client.post(f"/v1/submissions/{submission['id']}/tasks/{tasks[1]['id']}/confirm", headers=auth).status_code == 200
+    dispatch('test', {'chat': {'id': 101, 'type': 'private'}, 'from': {'id': 101}, 'text': '/start'}, factory)
+    assert calls[-1][1]['reply_markup']['inline_keyboard'][0][0]['callback_data'].startswith('work:')
+    calls.clear()
+    dispatch_callback('test', {'id': 'cb', 'from': {'id': 202}, 'message': {'chat': {'id': 202, 'type': 'private'}},
+                               'data': f"work:{submission['id']}:0"}, factory)
+    assert any('недоступна' in item.get('text', '') for _, item in calls)
+    assert not any('Ваш ответ' in item.get('text', '') for _, item in calls)
+
+
+def test_profile_pagination_lists_only_five_works(build_harness, monkeypatch):
+    harness = build_harness(sheet_billing_enabled=True)
+    auth, _ = harness.register()
+    code = class_code(harness, auth, 'class1')
+    factory = harness.app.state.session_factory
+    register(factory, code, 'Иванов Иван', 101)
+    for _ in range(6):
+        response = harness.client.post('/v1/submissions', headers=auth, files=[photograph()],
+                                       data={'class_reference': 'class1', 'student_reference': 'Иван Иванов'})
+        submission = response.json()
+        harness.process(submission['job_id'])
+        assert harness.client.post(f"/v1/submissions/{submission['id']}/confirm", headers=auth).status_code == 200
+    calls = []
+    monkeypatch.setattr('app.telegram_bot.call_telegram', lambda token, method, **kw: calls.append((method, kw)) or {'ok': True})
+    dispatch('test', {'chat': {'id': 101, 'type': 'private'}, 'from': {'id': 101}, 'text': '/start'}, factory)
+    keyboard = calls[-1][1]['reply_markup']['inline_keyboard']
+    assert sum(button['callback_data'].startswith('work:') for row in keyboard for button in row) == 5
+    assert any(button['callback_data'] == 'page:1' for row in keyboard for button in row)
+    dispatch_callback('test', {'id': 'cb', 'from': {'id': 101},
+        'message': {'message_id': 42, 'chat': {'id': 101, 'type': 'private'}}, 'data': 'page:1'}, factory)
+    assert calls[-1][0] == 'editMessageText'
+    keyboard = calls[-1][1]['reply_markup']['inline_keyboard']
+    assert sum(button['callback_data'].startswith('work:') for row in keyboard for button in row) == 1
+    assert any(button['callback_data'] == 'page:0' for row in keyboard for button in row)
+
+
+def test_teacher_sends_message_and_files_only_after_confirmation(build_harness, monkeypatch):
+    import httpx
+    harness = build_harness(sheet_billing_enabled=True, telegram_bot_token='test-token')
+    auth, _ = harness.register()
+    other, _ = harness.register()
+    code = class_code(harness, auth, 'class1')
+    register(harness.app.state.session_factory, code, 'Иванов Иван', 101)
+    response = harness.client.post('/v1/submissions', headers=auth, files=[photograph()],
+                                   data={'class_reference': 'class1', 'student_reference': 'Иван Иванов'})
+    submission = response.json()
+    harness.process(submission['job_id'])
+    path = f"/v1/telegram/submissions/{submission['id']}/message"
+    calls = []
+    def post(url, **kwargs):
+        calls.append((url.rsplit('/', 1)[-1], kwargs))
+        return httpx.Response(200, json={'ok': True})
+    monkeypatch.setattr('app.telegram_access.httpx.post', post)
+    assert harness.client.post(path, headers=other, data={'text': 'Чужой доступ'}).status_code == 404
+    assert harness.client.post(path, headers=auth, data={'text': 'До подтверждения'}).status_code == 409
+    assert calls == []
+    assert harness.client.post(f"/v1/submissions/{submission['id']}/confirm", headers=auth).status_code == 200
+    result = harness.client.post(path, headers=auth, data={'text': 'Посмотрите подсказку'},
+                                 files=[('files', ('help.pdf', b'%PDF-1.4 help', 'application/pdf'))])
+    assert result.status_code == 200, result.text
+    assert result.json()['sent_parts'] == 2
+    assert [method for method, _ in calls] == ['sendMessage', 'sendDocument']
+    assert all(data['data']['chat_id'] == 101 for _, data in calls)
+    assert calls[1][1]['files']['document'][1] == b'%PDF-1.4 help'
+    assert harness.submission(auth, submission['id'])['job_id'] == submission['job_id']
+
+
+def test_teacher_message_reports_partial_telegram_failure(build_harness, monkeypatch):
+    import httpx
+    harness = build_harness(sheet_billing_enabled=True, telegram_bot_token='test-token')
+    auth, _ = harness.register()
+    code = class_code(harness, auth, 'class1')
+    register(harness.app.state.session_factory, code, 'Иванов Иван', 101)
+    submission = harness.client.post('/v1/submissions', headers=auth, files=[photograph()],
+        data={'class_reference': 'class1', 'student_reference': 'Иван Иванов'}).json()
+    harness.process(submission['job_id'])
+    assert harness.client.post(f"/v1/submissions/{submission['id']}/confirm", headers=auth).status_code == 200
+    def post(url, **kwargs):
+        return httpx.Response(200 if url.endswith('sendMessage') else 500,
+                              json={'ok': url.endswith('sendMessage')})
+    monkeypatch.setattr('app.telegram_access.httpx.post', post)
+    result = harness.client.post(f"/v1/telegram/submissions/{submission['id']}/message", headers=auth,
+        data={'text': 'Проверьте'}, files=[('files', ('help.txt', b'help', 'text/plain'))])
+    assert result.status_code == 502
+    assert 'частей: 1' in result.text

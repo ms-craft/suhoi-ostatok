@@ -174,6 +174,100 @@ def test_reference_match_skips_model_and_mismatch_keeps_teacher_answer(monkeypat
     assert result[1].review.expected_answer_source == "teacher_test"
 
 
+def test_corrected_number_selects_the_matching_teacher_answer(build_harness):
+    from app.ai import FakeAIProvider, PreliminaryReview
+    from tests.support import photograph
+
+    class Provider(FakeAIProvider):
+        def recognize(self, pages, clarification):
+            return [RecognizedTask(page_number=1, number='1', answer='2', answer_state='present')]
+        def review_reference(self, task, reference, clarification):
+            return PreliminaryReview(status='incorrect', explanation='Ответ не совпадает.')
+
+    harness = build_harness(ai_provider=Provider(), sheet_billing_enabled=True)
+    auth, _ = harness.register()
+    refs = [{'question': 'Первое', 'answer': '1'}, {'question': 'Второе', 'answer': '2'}]
+    response = harness.client.post('/v1/submissions', headers=auth, files=[photograph()],
+                                   data={'test_questions': json.dumps(refs)})
+    assert response.status_code == 202
+    submission = response.json()
+    harness.process(submission['job_id'])
+    task, = harness.results(auth, submission['id'])['tasks']
+    path = f"/v1/submissions/{submission['id']}/tasks/{task['id']}"
+    assert task['preliminary']['expected_answer'] == '1'
+    assert harness.client.patch(path, headers=auth, json={'number': '0'}).status_code == 422
+    edited = harness.client.patch(path, headers=auth, json={'number': '2'})
+    assert edited.status_code == 200, edited.text
+    assert edited.json()['teacher']['number'] == '2'
+    assert edited.json()['recognition']['number'] == '1'
+    assert edited.json()['preliminary']['status'] == 'needs_review'
+    assert edited.json()['preliminary']['expected_answer'] is None
+    recheck = harness.client.post(path + '/recheck', headers=auth)
+    assert recheck.status_code == 202
+    harness.process(recheck.json()['job_id'])
+    result, = harness.results(auth, submission['id'])['tasks']
+    assert result['recognition']['number'] == '1'
+    assert result['teacher']['number'] == '2'
+    assert result['preliminary']['status'] == 'correct'
+    assert result['preliminary']['expected_answer'] == '2'
+
+
+def test_recheck_snapshots_latest_linked_teacher_work(build_harness):
+    from app.ai import FakeAIProvider, PreliminaryReview
+    from tests.support import photograph
+
+    class Provider(FakeAIProvider):
+        def recognize(self, pages, clarification):
+            return [RecognizedTask(page_number=1, number='1', answer='новый', answer_state='present')]
+        def review_reference(self, task, reference, clarification):
+            return PreliminaryReview(status='incorrect', explanation='Ответ отличается.')
+
+    harness = build_harness(ai_provider=Provider(), sheet_billing_enabled=True)
+    auth, _ = harness.register()
+    original = [{'question': 'Вопрос', 'answer': 'старый'}]
+    response = harness.client.post('/v1/submissions', headers=auth, files=[photograph()],
+                                   data={'test_questions': json.dumps(original, ensure_ascii=False)})
+    submission = response.json()
+    harness.process(submission['job_id'])
+    task, = harness.results(auth, submission['id'])['tasks']
+    assert task['preliminary']['expected_answer'] == 'старый'
+    data = {'classes': [], 'tests': [{'id': 'work1', 'name': 'Работа',
+                                     'questions': [{'question': 'Вопрос', 'answer': 'новый'}]}],
+            'links': {submission['id']: {'testId': 'work1'}}}
+    assert harness.client.put('/v1/workspace', headers=auth, json={'revision': 0, 'workspace': data}).status_code == 200
+    path = f"/v1/submissions/{submission['id']}/tasks/{task['id']}/recheck"
+    recheck = harness.client.post(path, headers=auth)
+    assert recheck.status_code == 202, recheck.text
+    # Later edits must not silently alter an already queued check.
+    data['tests'][0]['questions'][0]['answer'] = 'ещё новее'
+    assert harness.client.put('/v1/workspace', headers=auth, json={'revision': 1, 'workspace': data}).status_code == 200
+    harness.process(recheck.json()['job_id'])
+    result, = harness.results(auth, submission['id'])['tasks']
+    assert result['preliminary']['expected_answer'] == 'новый'
+    assert result['preliminary']['status'] == 'correct'
+    recheck = harness.client.post(path, headers=auth)
+    assert recheck.status_code == 202
+    harness.process(recheck.json()['job_id'])
+    result, = harness.results(auth, submission['id'])['tasks']
+    assert result['preliminary']['expected_answer'] == 'ещё новее'
+    assert result['preliminary']['status'] == 'incorrect'
+
+
+def test_recheck_rejects_missing_linked_teacher_work(build_harness):
+    from app.ai import FakeAIProvider
+    from tests.support import photograph
+    harness = build_harness(ai_provider=FakeAIProvider(), sheet_billing_enabled=True)
+    auth, _ = harness.register()
+    submission = harness.client.post('/v1/submissions', headers=auth, files=[photograph()]).json()
+    harness.process(submission['job_id'])
+    task, = harness.results(auth, submission['id'])['tasks']
+    workspace = {'classes': [], 'tests': [], 'links': {submission['id']: {'testId': 'deleted'}}}
+    assert harness.client.put('/v1/workspace', headers=auth, json={'revision': 0, 'workspace': workspace}).status_code == 200
+    result = harness.client.post(f"/v1/submissions/{submission['id']}/tasks/{task['id']}/recheck", headers=auth)
+    assert result.status_code == 409
+    assert harness.submission(auth, submission['id'])['job_id'] == submission['job_id']
+
+
 def test_reference_review_uses_teacher_condition_and_complete_solution(monkeypatch):
     captured = {}
     class Reply:

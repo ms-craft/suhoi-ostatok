@@ -235,6 +235,8 @@ class GeminiAIProvider:
         for group in _page_groups(pages):
             if self._openai_compatible:
                 content: list[dict] = []
+                if subject:
+                    content.append({"type": "text", "text": json.dumps({"subject": subject}, ensure_ascii=False)})
                 if clarification:
                     content.append({"type": "text", "text": f"Уточнение учителя: {clarification}"})
                 for page in group:
@@ -259,7 +261,7 @@ class GeminiAIProvider:
                     model_override=recognition_model,
                 )
             else:
-                parts = [{"text": json.dumps({"teacher_clarification": clarification}, ensure_ascii=False)}]
+                parts = [{"text": json.dumps({"teacher_clarification": clarification, "subject": subject}, ensure_ascii=False)}]
                 for page in group:
                     parts.append({"text": f"Номер следующей страницы: {page.number}"})
                     parts.append(
@@ -546,7 +548,12 @@ class GeminiAIProvider:
                 data = {"tasks": data}
             elif response_type is _ReviewResponse:
                 data = {"reviews": data}
+            elif response_type is _ExtractedQuestions:
+                data = {"questions": data}
         if isinstance(data, dict):
+            if response_type is _ExtractedQuestions and isinstance(data.get('questions'), list):
+                data['questions'] = [({'question': item} if isinstance(item, str) else item)
+                                     for item in data['questions']]
             if "tasks" in data and isinstance(data["tasks"], list):
                 for task in data["tasks"]:
                     if isinstance(task, dict):

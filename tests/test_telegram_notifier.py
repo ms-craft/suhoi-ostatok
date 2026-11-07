@@ -30,6 +30,13 @@ def test_missing_or_repeated_quotes_do_not_point_to_wrong_location():
     assert '<blockquote>' not in '\n'.join(messages)
 
 
+def test_corrected_task_number_is_used_in_student_result():
+    text = '\n'.join(format_result({}, [{'recognition': {'number': '1', 'answer': '2'},
+                                        'preliminary': {'status': 'correct', 'explanation': 'Верно.'},
+                                        'teacher': {'number': '2', 'confirmed_at': '2026-01-01'}}]))
+    assert '<b>Задание 2</b>' in text
+
+
 def test_original_recognition_and_its_ambiguity_are_not_lost_after_correction():
     messages = format_result({}, [{
         'original_recognition': {'answer': 'x₁ = -11\nx₂ = 32', 'ambiguity': 'Возможно, цифры записаны раздельно.'},

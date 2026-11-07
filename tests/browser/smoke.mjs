@@ -274,12 +274,17 @@ try {
   const taskPath = `/v1/submissions/${uploaded.id}/tasks/${task.id}`;
   await act('edit').click();
   const correction = page.locator('#correction-form');
+  await correction.locator('[name=number]').fill('2');
   await correction.locator('[name=answer]').fill('4');
   const edited = await responseFor(taskPath, 'PATCH', () => page.locator('[form=correction-form]').click());
   assert.equal(edited.teacher.answer, '4');
+  assert.equal(edited.teacher.number, '2');
+  assert.equal(edited.preliminary.status, 'needs_review');
+  await page.getByText('Первоначально распознанный номер').waitFor();
   assert.equal(edited.confirmed, false);
   const rechecked = await showResults(uploaded.id, () => act('recheck').click());
   assert.equal(rechecked.tasks.find(item => item.id === task.id).preliminary.status, 'correct');
+  assert.equal(rechecked.tasks.find(item => item.id === task.id).teacher.number, '2');
   const confirmed = await responseFor(taskPath + '/confirm', 'POST', () => act('confirm').click());
   assert.equal(confirmed.confirmed, true);
   assert.equal(confirmed.teacher.final_status, 'correct');
@@ -287,26 +292,13 @@ try {
 
   await act('clarify').click();
   const clarification = page.locator('#clarification-form');
-  await clarification.locator('[name=text]').fill('Дополнительная страница той же работы.');
+  await clarification.locator('[name=text]').fill('Комментарий ученику.');
   await clarification.locator('input[type=file]').setInputFiles(blue);
-  const update = await responseFor(`/v1/submissions/${uploaded.id}/clarifications`, 'POST',
-    () => page.locator('[form=clarification-form]').click());
-  assert.equal(update.page_count, 3);
-  await screen('check');
-  await page.getByText('Распознаём почерк', { exact: true }).waitFor();
-  let clarificationPolls = 0;
-  const workDetail = `/v1/submissions/${uploaded.id}`;
-  const watchClarification = request => {
-    if (request.method() === 'GET' && new URL(request.url()).pathname === workDetail) clarificationPolls++;
-  };
-  page.on('request', watchClarification);
-  await page.locator('#view [data-act=screen][data-screen=sheets]').first().click();
-  await screen('sheets');
-  const whenLeaving = clarificationPolls;
-  await page.waitForTimeout(2000);
-  assert.equal(clarificationPolls, whenLeaving, 'Status polling continued after leaving the screen');
-  page.off('request', watchClarification);
-  await showResults(uploaded.id, () => act('open-sheet').click());
+  const messageResponse = page.waitForResponse(response => response.url().endsWith(`/v1/telegram/submissions/${uploaded.id}/message`) && response.request().method() === 'POST');
+  await page.locator('[form=clarification-form]').click();
+  assert.equal((await messageResponse).status(), 409);
+  await page.locator('#modalError').waitFor();
+  await act('close-modal').last().click();
 
   await page.setViewportSize({ width: 320, height: 740 });
   await layout('result-mobile-320');
@@ -317,7 +309,7 @@ try {
   await deleteWork(uploaded.id);
   await page.waitForFunction(src => window.browserTestRevokedUrls.has(src), protectedImageUrl);
   assert.equal((await context.request.get(new URL(sourcePath, url).href, protectedRequest)).status(), 404);
-  console.log('OK correction, recheck, confirmation, clarification/processing, poll cancellation, deletion and mobile result');
+  console.log('OK correction, recheck, confirmation, Telegram message validation, deletion and mobile result');
 
   await context.close();
   ({ context, page } = await openBrowserPage({

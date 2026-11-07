@@ -3,10 +3,12 @@ import hashlib
 import re
 import secrets
 import unicodedata
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request, Response
+import httpx
+from fastapi import APIRouter, Depends, File, Form, Request, Response, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -15,7 +17,7 @@ from app.accounts import current_user
 from app.billing import lock_teacher
 from app.core import ApiError, utcnow
 from app.db import get_db
-from app.submission_models import Submission
+from app.submission_models import DetectedTask, Submission
 from app.telegram_models import TelegramBinding, TelegramClass, TelegramDelivery
 
 router = APIRouter(prefix='/telegram', tags=['Telegram'])
@@ -39,8 +41,19 @@ def valid_name(name: str) -> bool:
     )
 
 
+def fully_confirmed(db: Session, row: Submission) -> bool:
+    if row.status != 'completed' or row.first_completed_at is None or row.delete_requested_at is not None:
+        return False
+    tasks = db.scalars(select(DetectedTask).where(DetectedTask.submission_id == row.id)).all()
+    return bool(tasks) and all((task.teacher or {}).get('confirmed_at') for task in tasks)
+
+
 def schedule_submission(db: Session, row: Submission) -> None:
     existing = list(db.scalars(select(TelegramDelivery).where(TelegramDelivery.submission_id == row.id)))
+    if not fully_confirmed(db, row):
+        for item in existing:
+            db.delete(item)
+        return
     if not row.class_reference or not row.student_reference or row.delete_requested_at is not None:
         for item in existing:
             db.delete(item)
@@ -152,6 +165,8 @@ def delivery_status(submission_id: UUID, request: Request, db: DB, user_id: Owne
                                                       TelegramBinding.name_key == name_key(row.student_reference)))
     if binding is None:
         return {'status': 'student_not_linked', 'bot_configured': configured}
+    if not fully_confirmed(db, row):
+        return {'status': 'awaiting_confirmation', 'bot_configured': configured}
     delivery = db.scalar(select(TelegramDelivery).where(TelegramDelivery.submission_id == row.id,
                                                         TelegramDelivery.binding_id == binding.id))
     return {'status': delivery.status if delivery else 'not_scheduled', 'bot_configured': configured}
@@ -177,3 +192,57 @@ def retry_delivery(submission_id: UUID, db: DB, user_id: Owner):
     delivery.next_attempt_at = utcnow()
     db.commit()
     return {'status': 'pending'}
+
+
+@router.post('/submissions/{submission_id}/message')
+def send_teacher_message(submission_id: UUID, request: Request, db: DB, user_id: Owner,
+                         text: Annotated[str, Form(max_length=4000)] = '',
+                         files: list[UploadFile] = File(default=[])):
+    row = db.get(Submission, str(submission_id))
+    if row is None or row.user_id != user_id or row.delete_requested_at is not None:
+        raise ApiError(404, 'not_found', 'Работа не найдена.')
+    if not fully_confirmed(db, row):
+        raise ApiError(409, 'work_not_confirmed', 'Сначала подтвердите всю работу.')
+    cls = db.scalar(select(TelegramClass).where(TelegramClass.user_id == user_id,
+                                                TelegramClass.external_id == row.class_reference))
+    binding = db.scalar(select(TelegramBinding).where(TelegramBinding.class_id == cls.id,
+                        TelegramBinding.name_key == name_key(row.student_reference))) if cls else None
+    if binding is None:
+        raise ApiError(409, 'student_not_linked', 'Ученик не зарегистрирован в Telegram для этого класса.')
+    token = request.app.state.settings.telegram_bot_token
+    if not token:
+        raise ApiError(503, 'telegram_not_configured', 'Telegram-бот не настроен.')
+    text = text.strip()
+    if not text and not files:
+        raise ApiError(422, 'empty_message', 'Добавьте сообщение или файл.')
+    if len(files) > 10:
+        raise ApiError(413, 'too_many_files', 'Можно отправить до 10 файлов за один раз.')
+    prepared = []
+    total = 0
+    for upload in files:
+        content = upload.file.read(12 * 1024 * 1024 + 1)
+        total += len(content)
+        if not content or len(content) > 12 * 1024 * 1024 or total > 20 * 1024 * 1024:
+            raise ApiError(413, 'invalid_file_size', 'Файл должен быть непустым и не больше 12 МБ; всего до 20 МБ.')
+        filename = PurePosixPath(PureWindowsPath(upload.filename or 'file').name).name[:180] or 'file'
+        prepared.append((filename, content, upload.content_type or 'application/octet-stream'))
+    api = f'https://api.telegram.org/bot{token.get_secret_value()}/'
+    sent = 0
+    try:
+        if text:
+            response = httpx.post(api + 'sendMessage', data={'chat_id': binding.chat_id,
+                                  'text': 'Комментарий учителя к работе\n\n' + text}, timeout=30)
+            if not response.is_success or response.json().get('ok') is not True:
+                raise ValueError('telegram_send_failed')
+            sent += 1
+        for filename, content, content_type in prepared:
+            response = httpx.post(api + 'sendDocument', data={'chat_id': binding.chat_id,
+                                  'caption': 'Материал учителя к работе'},
+                                  files={'document': (filename, content, content_type)}, timeout=60)
+            if not response.is_success or response.json().get('ok') is not True:
+                raise ValueError('telegram_send_failed')
+            sent += 1
+    except (httpx.HTTPError, ValueError):
+        raise ApiError(502, 'telegram_send_failed',
+                       f'Не удалось отправить всё сообщение. Уже отправлено частей: {sent}. Проверьте чат перед повтором.')
+    return {'sent_parts': sent}

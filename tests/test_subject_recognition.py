@@ -141,7 +141,6 @@ def test_catalog_and_custom_subjects(harness):
     suggestions = harness.client.get('/v1/subjects', headers=auth, params={'q': 'ФИЗ'}).json()
     assert suggestions == [{'name': 'Физика', 'category': 'stem'}]
     harness.subscribe(auth)
-    assert harness.client.post('/v1/submissions', headers=auth, files=[photograph()], data={'test_subject': 'Мой предмет'}).status_code == 422
     response = harness.client.post('/v1/submissions', headers=auth, files=[photograph()],
                                    data={'test_subject': 'физика', 'test_subject_category': 'humanities'})
     assert response.status_code == 202
@@ -149,12 +148,22 @@ def test_catalog_and_custom_subjects(harness):
     assert _load_inputs(harness.app.state, claim)[-2:] == ('физика', 'stem')
 
 
+def test_custom_subject_uses_advanced_model_automatically(harness):
+    auth, _ = harness.register()
+    harness.subscribe(auth)
+    response = harness.client.post('/v1/submissions', headers=auth, files=[photograph()], data={'test_subject': 'Краеведение'})
+    assert response.status_code == 202
+    claim = SimpleNamespace(submission_id=response.json()['id'], kind='initial', task_id=None)
+    assert _load_inputs(harness.app.state, claim)[-2:] == ('Краеведение', 'humanities')
+
+
 def test_custom_humanities_uses_advanced_model(monkeypatch):
     captured = []
     def post(url, **kwargs):
-        captured.append(kwargs['json']['model'])
+        captured.append(kwargs['json'])
         return httpx.Response(200, json={'choices': [{'finish_reason': 'stop', 'message': {'content': '{"tasks": []}'}}]})
     monkeypatch.setattr('app.ai.gemini.httpx.post', post)
     provider = GeminiAIProvider('key', api_base='https://example.test/v1', recognition_model='gemini-3.5-flash-lite')
     provider.recognize_with_name([PageInput(1, b'img', 'image/jpeg')], None, subject='Краеведение', subject_category='humanities')
-    assert captured == ['gemini-3.8-flash']
+    assert captured[0]['model'] == 'gemini-3.8-flash'
+    assert any('Краеведение' in part.get('text', '') for part in captured[0]['messages'][1]['content'])

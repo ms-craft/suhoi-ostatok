@@ -29,6 +29,7 @@ BUSY = {"queued", "processing"}
 class Correction(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
+    number: str | None = Field(None, max_length=80, pattern=r'^[1-9][0-9]*$')
     condition: str | None = Field(None, max_length=8000)
     answer: str | None = Field(None, max_length=16000)
     status: ReviewStatus | None = None
@@ -78,6 +79,7 @@ class JobView(BaseModel):
 
 
 class TeacherView(BaseModel):
+    number: str | None = None
     condition: str | None = None
     answer: str | None = None
     status: ReviewStatus | None = None
@@ -314,9 +316,7 @@ def upload(
         from app.subjects import Subject
         known = next((item for item in db.scalars(select(Subject)).all() if item.name.casefold() == test_subject.casefold()), None)
         legacy = {'math': 'stem', 'russian': 'humanities', 'belarusian': 'humanities', 'literature': 'humanities', 'history': 'humanities', 'social_studies': 'humanities', 'english': 'humanities', 'other_humanities': 'humanities'}
-        test_subject_category = known.category if known else legacy.get(test_subject, test_subject_category)
-        if not test_subject_category:
-            raise ApiError(422, 'subject_category_required', 'Укажите тип предмета для выбранной работы.')
+        test_subject_category = known.category if known else legacy.get(test_subject, 'humanities')
     references = []
     if test_questions:
         try:
@@ -505,6 +505,13 @@ def correct(submission_id: UUID, task_id: UUID, body: Correction, db: DB, user_i
     changes = body.model_dump(mode="json", exclude_unset=True)
     if not changes:
         raise ApiError(422, "missing_correction", "Укажите хотя бы одно исправление.")
+    previous_number = (task.teacher or {}).get('number', task.recognition.get('number'))
+    if 'number' in changes and changes['number'] != previous_number:
+        task.preliminary = PreliminaryReview(
+            status='needs_review',
+            explanation='Номер задания изменён. Перепроверьте задание, чтобы сверить ответ с соответствующим заданием работы.',
+            uncertainty='Ожидается повторная проверка.',
+        ).model_dump(mode='json')
     task.teacher = {
         **(task.teacher or {}), **changes, "confirmed_at": None, "final_status": None,
     }
@@ -520,7 +527,29 @@ def recheck(request: Request, submission_id: UUID, task_id: UUID, db: DB, user_i
     check_idle(row)
     task = task_for(db, row, task_id)
     check_followups(db, user_id, sheets=request.app.state.settings.sheet_billing_enabled)
-    job = enqueue(db, row, "recheck", task_id=task.id)
+    from app.workspace import TeacherWorkspace
+    workspace = db.get(TeacherWorkspace, user_id)
+    data = workspace.data if workspace and isinstance(workspace.data, dict) else {}
+    links = data.get('links') if isinstance(data.get('links'), dict) else {}
+    link = links.get(row.id)
+    test_id = link.get('testId') if isinstance(link, dict) else None
+    snapshot = None
+    if test_id:
+        tests = data.get('tests') if isinstance(data.get('tests'), list) else []
+        test = next((item for item in tests if isinstance(item, dict) and item.get('id') == test_id), None)
+        if test is None:
+            raise ApiError(409, 'test_not_found', 'Связанная работа не найдена. Проверьте раздел «Мои работы».')
+        try:
+            questions = test.get('questions')
+            if not isinstance(questions, list) or not 1 <= len(questions) <= 50:
+                raise ValueError()
+            references = [TestQuestion.model_validate(item).model_dump() for item in questions]
+            snapshot = json.dumps({'questions': references}, ensure_ascii=False)
+            if len(snapshot) > 30000:
+                raise ValueError()
+        except (ValueError, TypeError):
+            raise ApiError(409, 'invalid_test', 'Проверьте задания и ответы связанной работы.') from None
+    job = enqueue(db, row, "recheck", task_id=task.id, clarification=snapshot)
     db.commit()
     notify(request.app.state, job.id, row.id, user_id)
     return submission_data(row)
@@ -543,6 +572,27 @@ def confirm(submission_id: UUID, task_id: UUID, db: DB, user_id: Owner):
         schedule_submission(db, row)
         db.commit()
     return task_data(task)
+
+
+@router.post("/{submission_id}/confirm")
+def confirm_work(submission_id: UUID, db: DB, user_id: Owner):
+    row = owned(db, submission_id, user_id, lock=True)
+    check_idle(row)
+    tasks = db.scalars(select(DetectedTask).where(DetectedTask.submission_id == row.id)
+                       .order_by(DetectedTask.position)).all()
+    if not tasks or row.status != 'completed':
+        raise ApiError(409, 'nothing_to_confirm', 'Нет готовых заданий для подтверждения.')
+    for task in tasks:
+        teacher = task.teacher or {}
+        if not teacher.get('confirmed_at'):
+            task.teacher = {**teacher, 'confirmed_at': utcnow().isoformat(),
+                            'final_status': teacher.get('status') or task.preliminary['status']}
+            db.add(TeacherEdit(task_id=task.id, kind='confirmation', snapshot={
+                **task.teacher, 'recognition': task.recognition, 'preliminary': task.preliminary,
+            }))
+    schedule_submission(db, row)
+    db.commit()
+    return {'confirmed': len(tasks)}
 
 
 @router.delete("/{submission_id}", status_code=204)

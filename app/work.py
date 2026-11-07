@@ -160,6 +160,7 @@ def _load_inputs(state, claim: Claim) -> tuple[list, list[InputTask], str | None
         initial = db.scalar(select(ProcessingJob.clarification).where(
             ProcessingJob.submission_id == claim.submission_id, ProcessingJob.kind == "initial"
         ).order_by(ProcessingJob.created_at.asc()).limit(1))
+        recheck_snapshot = db.get(ProcessingJob, claim.job_id).clarification if claim.kind == 'recheck' else None
     clarification = "\n\n".join(reversed(notes))[-4000:] if notes else None
     try:
         metadata = json.loads(initial) if initial else []
@@ -172,6 +173,13 @@ def _load_inputs(state, claim: Claim) -> tuple[list, list[InputTask], str | None
         references = []
         subject = None
         subject_category = None
+    if recheck_snapshot:
+        try:
+            current = json.loads(recheck_snapshot)
+            if isinstance(current, dict) and isinstance(current.get('questions'), list):
+                references = current['questions']
+        except (ValueError, TypeError):
+            pass
     return pages, tasks, clarification, references, subject, subject_category
 
 
@@ -188,6 +196,8 @@ def _source_pages(state, pages: list) -> list[PageInput]:
 
 def _effective(recognition: RecognizedTask, teacher: dict | None) -> RecognizedTask:
     data = recognition.model_dump()
+    if teacher and 'number' in teacher:
+        data['number'] = teacher['number'] or None
     if teacher and "condition" in teacher:
         corrected_condition = (teacher["condition"] or "").strip() or None
         if corrected_condition != recognition.condition:

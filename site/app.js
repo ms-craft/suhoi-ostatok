@@ -30,6 +30,12 @@
     return result + plain(text.slice(last));
   }
 
+  function mathPreview(value) {
+    const text = String(value ?? '');
+    const rendered = mathText(text);
+    return `<span class="math-preview" data-math-preview${rendered === esc(text) ? ' hidden' : ''}><span class="math-preview-label">Как будет выглядеть</span><span class="math-preview-content">${rendered}</span></span>`;
+  }
+
   const FILE_TYPES = 'image/jpeg,image/png,image/heic,image/heif,application/pdf,.jpg,.jpeg,.png,.heic,.heif,.pdf';
   const LEGACY_SUBJECTS = [
     ['math', 'Математика'], ['russian', 'Русский язык'], ['belarusian', 'Белорусский язык'],
@@ -72,11 +78,13 @@
   let activeClass = null;
   let activeTest = '';
   let editingTest = '';
+  let questionEdit = null;
   let addingWorkspaceItem = '';
   let workspaceError = '';
   let telegramClassCode = null;
   let telegramClassInfo = null;
   let telegramStudentToRemove = null;
+  let telegramStudentsExpanded = false;
   let telegramDelivery = null;
   let editingStudentName = false;
   const questionImports = new Map();
@@ -144,9 +152,12 @@
   }
   async function flushWorkspace() {
     const session = api.getSession(), sync = workspaceSync;
-    if (!session || !sync.ready || sync.running || sync.conflict) return;
+    if (sync.running) return sync.runningPromise;
+    if (!session || !sync.ready || sync.conflict) return;
     const hadError = !!sync.error;
     sync.running = true;
+    let finish;
+    sync.runningPromise = new Promise(resolve => { finish = resolve; });
     try {
       while (sync.dirty && sync.ready && session === api.getSession() && sync === workspaceSync) {
         const snapshot = JSON.stringify(workspace);
@@ -178,6 +189,16 @@
         sync.running = false;
         if (state.screen === 'home' && (hadError || sync.error || sync.conflict)) render();
       }
+      finish();
+    }
+  }
+
+  async function ensureWorkspaceSynced() {
+    const sync = workspaceSync, session = api.getSession();
+    if (sync.running) await sync.runningPromise;
+    if (sync.dirty && sync.ready && !sync.conflict) await flushWorkspace();
+    if (session !== api.getSession() || sync !== workspaceSync || !sync.ready || sync.dirty || sync.error || sync.conflict) {
+      throw new Error('Не удалось синхронизировать работу. Проверьте соединение или разрешите конфликт на главном экране.');
     }
   }
   const newId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
@@ -287,7 +308,6 @@
     const questions = Array.isArray(test.questions) ? test.questions : [];
     const legacy = LEGACY_SUBJECTS.find(([value]) => value === test.subject);
     const subjectName = legacy?.[1] || test.subject || '';
-    const category = subjectCategory(test);
     const imported = questionImports.get(test.id);
     return `${back('home', test.name, 'Задания и правильные ответы')}
       <div class="card card-pad" style="margin-bottom:14px">
@@ -295,23 +315,25 @@
           <input id="test-subject" type="text" list="subject-suggestions" maxlength="100" autocomplete="off" value="${esc(subjectName)}" placeholder="Например, физика или русский язык">
           <datalist id="subject-suggestions">${subjectCatalog.map(item => `<option value="${esc(item.name)}"></option>`).join('')}</datalist>
         </label>
-        <label class="form-field" style="margin-top:10px">Тип предмета
-          <select id="test-subject-category"><option value="">Выберите тип</option><option value="stem" ${category === 'stem' ? 'selected' : ''}>Математика и естественные науки</option><option value="humanities" ${category === 'humanities' ? 'selected' : ''}>Гуманитарные предметы и языки</option></select>
-        </label>
-        <p class="page-sub">Выберите подсказку для автоматического определения типа или укажите его вручную для своего предмета.</p>
       </div>
       ${questions.length > 1 ? '<p class="question-order-hint">Порядок определяет номера заданий при проверке.</p>' : ''}
       ${questions.map((q, i) => `<div class="card card-pad question-card" style="margin-bottom:10px">
-        <div class="question-card-head"><b>Задание ${i + 1}</b><div class="question-order" aria-label="Изменить порядок задания ${i + 1}">
-          <button type="button" class="question-move" data-act="move-question" data-index="${i}" data-step="-1" aria-label="Переместить задание ${i + 1} вверх" ${i === 0 ? 'disabled' : ''}>↑</button>
-          <button type="button" class="question-move" data-act="move-question" data-index="${i}" data-step="1" aria-label="Переместить задание ${i + 1} вниз" ${i === questions.length - 1 ? 'disabled' : ''}>↓</button>
-        </div></div><p style="white-space:pre-wrap">${mathText(q.question)}</p><p class="page-sub">Правильный ответ: ${mathText(q.answer)}</p><button type="button" class="btn btn-quiet" data-act="remove-question" data-index="${i}">Удалить</button></div>`).join('')}
-      ${imported?.questions?.length ? `<form id="import-answers-form" class="card card-pad stack" style="margin-bottom:14px">
+        <div class="question-card-head"><b>Задание ${i + 1}</b><div class="question-order">
+          <button type="button" class="question-move" data-act="edit-question" data-index="${i}" aria-label="Редактировать задание ${i + 1}" ${questionEdit ? 'disabled' : ''}>${icon('pen', 18)}</button>
+          <button type="button" class="question-move" data-act="move-question" data-index="${i}" data-step="-1" aria-label="Переместить задание ${i + 1} вверх" ${i === 0 || questionEdit ? 'disabled' : ''}>↑</button>
+          <button type="button" class="question-move" data-act="move-question" data-index="${i}" data-step="1" aria-label="Переместить задание ${i + 1} вниз" ${i === questions.length - 1 || questionEdit ? 'disabled' : ''}>↓</button>
+        </div></div>${questionEdit?.testId === test.id && questionEdit.index === i ? `<form id="edit-question-form" class="stack-sm">
+          <label class="form-field">Условие<textarea data-math-input data-question-edit="question" name="question" maxlength="8000" rows="3" required>${esc(questionEdit.question)}</textarea>${mathPreview(questionEdit.question)}</label>
+          <label class="form-field">Правильный ответ<textarea data-math-input data-question-edit="answer" name="answer" maxlength="3000" rows="2" required>${esc(questionEdit.answer)}</textarea>${mathPreview(questionEdit.answer)}</label>
+          ${questionEdit.error ? `<p class="form-error" role="alert">${esc(questionEdit.error)}</p>` : ''}
+          <button type="submit" class="btn btn-primary">Сохранить изменения</button>${btn('cancel-edit-question', 'Отмена', 'btn-ghost')}
+        </form>` : `<p style="white-space:pre-wrap">${mathText(q.question)}</p><p class="page-sub">Правильный ответ: ${mathText(q.answer)}</p><button type="button" class="btn btn-quiet" data-act="remove-question" data-index="${i}" ${questionEdit ? 'disabled' : ''}>Удалить</button>`}</div>`).join('')}
+      ${imported?.questions?.length && !imported.pending ? `<form id="import-answers-form" class="card card-pad stack" style="margin-bottom:14px">
         <h2>Задания с фотографии</h2>
         <p class="page-sub">Проверьте условия и их порядок, затем впишите правильный ответ под каждым заданием.</p>
         ${imported.questions.map((item, i) => `<div class="import-question stack-sm">
-          <label class="form-field">Задание ${questions.length + i + 1}<textarea data-import-index="${i}" data-import-field="question" maxlength="8000" rows="3" required>${esc(item.question)}</textarea></label>
-          <label class="form-field">Правильный ответ<textarea data-import-index="${i}" data-import-field="answer" maxlength="3000" rows="2" required>${esc(item.answer)}</textarea></label>
+          <label class="form-field">Задание ${questions.length + i + 1}<textarea data-math-input data-import-index="${i}" data-import-field="question" maxlength="8000" rows="3" required>${esc(item.question)}</textarea>${mathPreview(item.question)}</label>
+          <label class="form-field">Правильный ответ<textarea data-math-input data-import-index="${i}" data-import-field="answer" maxlength="3000" rows="2" required>${esc(item.answer)}</textarea>${mathPreview(item.answer)}</label>
           <button type="button" class="btn btn-ghost btn-sm import-remove" data-act="remove-import-question" data-index="${i}">${icon('trash', 17)} Убрать задание</button>
         </div>`).join('')}
         ${imported.error ? `<p class="form-error" role="alert">${esc(imported.error)}</p>` : ''}
@@ -319,26 +341,20 @@
         ${btn('cancel-question-import', 'Отменить распознавание', 'btn-ghost btn-block')}
       </form>` : `<form id="question-photo-form" class="card card-pad stack" style="margin-bottom:14px">
         <h2>Задания с фотографии</h2>
-        <p class="page-sub">Выберите фотографию печатных заданий. Она будет отправлена для распознавания; запрос к модели может быть платным.</p>
-        <label class="form-field">Фотография<input type="file" name="photo" accept="image/jpeg,image/png,image/heic,image/heif,.jpg,.jpeg,.png,.heic,.heif" required ${imported?.pending ? 'disabled' : ''}></label>
+        <p class="page-sub">Выберите фотографии печатных заданий в порядке страниц. Каждая будет отправлена отдельно; запросы к модели могут быть платными.</p>
+        <label class="form-field">Фотографии<input type="file" name="photo" accept="image/jpeg,image/png,image/heic,image/heif,.jpg,.jpeg,.png,.heic,.heif" multiple required ${imported?.pending ? 'disabled' : ''}></label>
         ${imported?.error ? `<p class="form-error" role="alert">${esc(imported.error)}</p>` : ''}
         <button type="submit" class="btn btn-ghost btn-block" ${imported?.pending ? 'disabled' : ''}>${imported?.pending ? 'Распознаём задания…' : 'Распознать задания'}</button>
-        ${imported?.pending ? '<p class="page-sub" role="status">Ожидаем ответ модели. Не запускайте повторно.</p>' : ''}
+        ${imported?.pending ? `<p class="page-sub" role="status">Распознаём фотографию ${imported.current} из ${imported.total}. Не запускайте повторно.</p>` : ''}
       </form>`}
       <form id="question-form" class="card card-pad stack">
         <h2>Новое задание</h2>
-        <label class="form-field">Условие<textarea name="question" maxlength="8000" required rows="3"></textarea></label>
-        <label class="form-field">Правильный ответ<textarea name="answer" maxlength="3000" required rows="2"></textarea></label>
+        <label class="form-field">Условие<textarea data-math-input name="question" maxlength="8000" required rows="3"></textarea>${mathPreview('')}</label>
+        <label class="form-field">Правильный ответ<textarea data-math-input name="answer" maxlength="3000" required rows="2"></textarea>${mathPreview('')}</label>
         ${workspaceError ? `<p class="form-error" role="alert">${esc(workspaceError)}</p>` : ''}
         <button type="submit" class="btn btn-primary btn-block">Добавить задание</button>
       </form>`;
   }
-  function subjectCategory(test) {
-    const legacy = LEGACY_SUBJECTS.find(([value]) => value === test.subject);
-    const known = subjectCatalog.find(item => item.name.toLocaleLowerCase('ru') === String(test.subject || '').trim().toLocaleLowerCase('ru'));
-    return known?.category || (legacy ? (legacy[0] === 'math' ? 'stem' : 'humanities') : test.subjectCategory || '');
-  }
-
   async function loadSubjectCatalog(signal) {
     try {
       const result = await api.request('/v1/subjects', { signal });
@@ -346,11 +362,8 @@
       subjectCatalog = result;
       const suggestions = document.getElementById('subject-suggestions');
       if (suggestions) suggestions.innerHTML = result.map(item => `<option value="${esc(item.name)}"></option>`).join('');
-      const selector = document.getElementById('test-subject-category');
-      const test = workspace.tests.find(item => item.id === editingTest);
-      if (selector && test) selector.value = subjectCategory(test);
     } catch (error) {
-      if (!signal.aborted) toast('Подсказки предметов недоступны. Можно ввести предмет и выбрать тип вручную.', true);
+      if (!signal.aborted) toast('Подсказки предметов недоступны. Можно ввести предмет вручную.', true);
     }
   }
   function saveQuestion(form) {
@@ -370,26 +383,63 @@
     render();
   }
 
+  function saveQuestionEdit(form) {
+    const draft = questionEdit;
+    const test = workspace.tests.find(item => item.id === editingTest);
+    if (!draft || !test || draft.testId !== test.id || !test.questions?.[draft.index]) return;
+    const question = form.elements.question.value.trim();
+    const answer = form.elements.answer.value.trim();
+    if (!question || !answer) return;
+    const previous = test.questions;
+    test.questions = previous.map((item, index) => index === draft.index ? { ...item, question, answer } : item);
+    try { saveWorkspace(); } catch {
+      test.questions = previous;
+      draft.error = 'Не удалось сохранить изменения в браузере.';
+      render();
+      return;
+    }
+    questionEdit = null;
+    render();
+    document.querySelector(`[data-act="edit-question"][data-index="${draft.index}"]`)?.focus({ preventScroll: true });
+  }
+
   async function importQuestionPhoto(form) {
-    const file = form.elements.photo.files[0];
+    const files = [...form.elements.photo.files];
     const testId = editingTest;
-    if (!file || questionImports.get(testId)?.pending) return;
-    const draft = { pending: true, questions: [], error: '' };
+    if (!files.length || questionImports.get(testId)?.pending) return;
+    const draft = { pending: true, questions: [], error: '', current: 1, total: files.length };
     questionImports.set(testId, draft);
-    const body = new FormData();
-    body.append('file', file);
     render();
     try {
-      const result = await api.request('/v1/question-import', { method: 'POST', body });
-      if (questionImports.get(testId) !== draft) return;
-      draft.questions = result.questions.map(item => ({ question: item.question, answer: '' }));
-      if (!draft.questions.length) draft.error = 'Задания не найдены. Попробуйте фотографию получше или добавьте задание вручную.';
-      if (result.demonstration) draft.error = 'Демонстрационный результат: фотография не распознавалась.';
-    } catch (error) {
-      if (questionImports.get(testId) !== draft) return;
-      draft.error = error?.code === 'network_error' || error?.code === 'api_unavailable'
-        ? 'Связь прервалась. Запрос мог быть платным; проверьте состояние у провайдера перед повтором.'
-        : errorText(error);
+      const problems = [];
+      let demonstration = false;
+      for (let index = 0; index < files.length; index++) {
+        if (questionImports.get(testId) !== draft) return;
+        draft.current = index + 1;
+        if (state.screen === 'test' && editingTest === testId) render();
+        const body = new FormData();
+        body.append('file', files[index]);
+        try {
+          const result = await api.request('/v1/question-import', { method: 'POST', body });
+          if (questionImports.get(testId) !== draft) return;
+          draft.questions.push(...result.questions.map(item => ({ question: item.question, answer: '' })));
+          if (!result.questions.length) problems.push(`На фотографии «${files[index].name}» задания не найдены.`);
+          demonstration ||= result.demonstration;
+        } catch (error) {
+          if (questionImports.get(testId) !== draft) return;
+          const disconnected = error?.code === 'network_error' || error?.code === 'api_unavailable';
+          problems.push(`Фотография «${files[index].name}»: ${disconnected
+            ? 'связь прервалась. Запрос мог быть платным; проверьте состояние у провайдера перед повтором.'
+            : errorText(error)}`);
+          if (disconnected) {
+            if (index + 1 < files.length) problems.push(`Оставшиеся фотографии не отправлены: ${files.length - index - 1}.`);
+            break;
+          }
+        }
+      }
+      if (demonstration) problems.push('Демонстрационный результат: фотографии не распознавались.');
+      if (problems.length && draft.questions.length) problems.push('Сохраните найденные задания, затем добавьте недостающие фотографии.');
+      draft.error = problems.join(' ');
     } finally {
       draft.pending = false;
       if (state.screen === 'test' && editingTest === testId && questionImports.get(testId) === draft) render();
@@ -513,7 +563,10 @@
   const reviewStatus = task => task.confirmed ? task.teacher?.final_status || task.preliminary.status : task.preliminary.status;
   const reviewLabel = status => REVIEWS[status] || ['Нужна проверка', 'warn'];
   const chosenTask = () => state.results?.tasks.find(task => task.id === state.modal?.taskId);
-  const taskName = task => task.recognition.number ? `Задание № ${task.recognition.number}` : `Задание · страница ${task.source_page}`;
+  const taskName = task => {
+    const number = Object.hasOwn(task.teacher || {}, 'number') ? task.teacher.number : task.recognition.number;
+    return number ? `Задание № ${number}` : `Задание · страница ${task.source_page}`;
+  };
   const followupLabel = () => state.subscription?.allow_followups === false ? 'Уточнения и перепроверка доступны по действующему тарифу.' : '';
   const errorText = error => error?.message || 'Не удалось выполнить действие. Попробуйте ещё раз.';
   const alert = (message, id = '') => `<p ${id ? `id="${id}"` : ''} class="form-error" role="alert"${message ? '' : ' hidden'}>${esc(message)}</p>`;
@@ -644,8 +697,10 @@
           ${!telegramClassInfo && !telegramClassCode.configured ? '<p class="form-error">Бот ещё не подключён: на сервере нужен TELEGRAM_BOT_TOKEN.</p>' : ''}` : ''}
         ${telegramClassCode?.classId === activeClass && telegramClassCode.error ? `<p class="form-error" role="alert">${esc(telegramClassCode.error)}</p>` : ''}
         ${btn('telegram-class-code', (telegramClassCode?.classId === activeClass && telegramClassCode.code) || (telegramClassInfo?.classId === activeClass && telegramClassInfo.exists) ? 'Создать новый код' : 'Создать код класса', 'btn-ghost', '', state.pending ? 'disabled' : '')}
-        ${telegramClassInfo?.classId === activeClass && telegramClassInfo.exists ? btn('telegram-refresh-class', 'Обновить список учеников', 'btn-quiet btn-sm') : ''}
-        ${telegramClassInfo?.classId === activeClass && telegramClassInfo.students.length ? `<div class="stack-sm"><b>Зарегистрированные ученики</b>
+        ${telegramClassInfo?.classId === activeClass && telegramClassInfo.exists ? `<button type="button" class="btn btn-quiet" data-act="telegram-toggle-students" aria-expanded="${telegramStudentsExpanded}">Зарегистрированные ученики · ${telegramClassInfo.students.length} ${telegramStudentsExpanded ? '↑' : '↓'}</button>` : ''}
+        ${telegramStudentsExpanded && telegramClassInfo?.classId === activeClass && telegramClassInfo.exists ? `<div class="stack-sm">
+          ${btn('telegram-refresh-class', 'Обновить список учеников', 'btn-quiet btn-sm')}
+          ${telegramClassInfo.students.length ? '' : '<p class="page-sub">Пока никто не зарегистрирован.</p>'}
           ${telegramClassInfo.students.map(student => `<div class="between"><span>${esc(student.name)}</span>${telegramStudentToRemove === student.id
             ? `<span>${btn('telegram-remove-student', 'Отключить', 'btn-ghost btn-sm', '', `data-id="${esc(student.id)}"`)} ${btn('telegram-cancel-remove', 'Отмена', 'btn-quiet btn-sm')}</span>`
             : btn('telegram-ask-remove', 'Отвязать', 'btn-quiet btn-sm', '', `data-id="${esc(student.id)}"`)}</div>`).join('')}</div>` : ''}
@@ -768,7 +823,7 @@
       const [label, color] = reviewLabel(reviewStatus(task));
       return `<button type="button" class="sheet-item" data-act="open-task" data-id="${esc(task.id)}">
         <span class="ava">${icon(task.confirmed ? 'checkCircle' : 'clipboard', 17)}</span>
-        <span class="who"><b>${esc(taskName(task))}</b><span>Стр. ${esc(task.source_page)} · ${task.confirmed ? 'Подтверждено' : 'Предварительно'}</span></span>
+        <span class="who"><b>${mathText(taskName(task))}</b><span>Стр. ${esc(task.source_page)} · ${task.confirmed ? 'Подтверждено' : 'Предварительно'}</span></span>
         <span class="chip ${color} task-status">${esc(label)}</span>
         <span class="chev">${icon('chevRight', 18)}</span>
       </button>`;
@@ -796,6 +851,7 @@
         <div class="sheet-list">${rows || empty(tasks.length ? 'По этому фильтру нет заданий.' : 'Задания не найдены. Проверьте исходную страницу или добавьте уточнение.')}</div>
       </div>
       <div class="stack-sm" style="margin-top:12px">
+        ${tasks.length && confirmed < tasks.length && work.status === 'completed' ? btn('confirm-work', state.pending ? 'Подтверждаем…' : 'Подтвердить всю работу', 'btn-primary btn-block', 'check', state.pending ? 'disabled' : '') : ''}
         <div id="telegram-delivery-status" class="card card-pad stack-sm">${telegramDeliveryContent(work.id)}</div>
         ${btn('preview', 'Открыть исходную страницу', 'btn-ghost btn-block', 'image')}
         ${editingStudentName ? `<form id="student-name-form" class="card card-pad stack-sm"><label class="form-field">Фамилия и имя ученика
@@ -803,7 +859,7 @@
           <p class="page-sub">Для Telegram ФИО должно совпадать с регистрацией ученика в этом классе.</p>
           <button class="btn btn-primary" type="submit" ${state.pending ? 'disabled' : ''}>Сохранить ФИО</button>
           ${btn('cancel-student-name', 'Отмена', 'btn-ghost')}</form>` : btn('edit-student-name', 'Исправить ФИО ученика', 'btn-ghost btn-block')}
-        ${btn('clarify', 'Добавить уточнение или страницу', 'btn-ghost btn-block', 'plus')}
+        ${btn('clarify', 'Отправить сообщение ученику', 'btn-ghost btn-block', 'plus')}
         ${deleteControls()}
       </div>`;
   }
@@ -921,7 +977,7 @@
       const on = item.id === task.id;
       const status = reviewStatus(item);
       return `<button type="button" class="task-chip${on ? ' on' : ''}${on && status === 'incorrect' ? ' err-chip' : ''}"
-        data-act="task" data-id="${esc(item.id)}" aria-pressed="${on}">${esc(taskName(item))}
+        data-act="task" data-id="${esc(item.id)}" aria-pressed="${on}">${mathText(taskName(item))}
         <span class="st ${status === 'correct' ? 'ok' : status === 'incorrect' ? 'err' : ''}">
           ${icon(status === 'correct' ? 'check' : status === 'incorrect' ? 'x' : 'alert', 15)}
         </span></button>`;
@@ -929,7 +985,7 @@
     return `
       <div class="task-chips" aria-label="Задания" style="margin-bottom:16px">${tabs}</div>
       <div class="between" style="margin-bottom:12px">
-        <span class="section-title">${esc(taskName(task))}</span><span class="chip ${color} task-status">${esc(label)}</span>
+        <span class="section-title">${mathText(taskName(task))}</span><span class="chip ${color} task-status">${esc(label)}</span>
       </div>
       <div class="stack">
         <div class="chiprow">
@@ -937,6 +993,7 @@
           ${task.demonstration ? '<span class="chip blue">Демонстрационные данные</span>' : ''}
         </div>
         ${textDetail('Распознанное условие', rec.condition || 'Условие не найдено')}
+        ${Object.hasOwn(teacher, 'number') ? textDetail('Первоначально распознанный номер', rec.number || 'Номер не распознан') : ''}
         <div class="compare">
           <div class="cell ${answerColor}"${review.expected_answer ? '' : ' style="grid-column:1/-1"'}>
             <div class="l">${editedAnswer ? 'Исходное распознавание ответа' : 'Ответ ученика'}</div><div class="v" ${editedAnswer ? '' : 'data-student-answer'}>${mathText(rec.answer || '—')}</div>
@@ -967,18 +1024,20 @@
 
   function editContent(task) {
     const teacher = task.teacher || {};
+    const number = Object.hasOwn(teacher, 'number') ? teacher.number : task.recognition.number;
     const condition = Object.hasOwn(teacher, 'condition') ? teacher.condition : task.recognition.condition;
     const answer = Object.hasOwn(teacher, 'answer') ? teacher.answer : task.recognition.answer;
     return `
       <form id="correction-form" class="stack">
-        <label class="form-field">Условие<textarea name="condition" rows="3" maxlength="8000">${esc(condition)}</textarea></label>
-        <label class="form-field">Ответ ученика<textarea name="answer" rows="2" maxlength="16000">${esc(answer)}</textarea></label>
+        <label class="form-field">Номер задания<input name="number" type="text" inputmode="numeric" maxlength="80" value="${esc(number || '')}" placeholder="Например, 2"></label>
+        <label class="form-field">Условие<textarea data-math-input name="condition" rows="3" maxlength="8000">${esc(condition)}</textarea>${mathPreview(condition)}</label>
+        <label class="form-field">Ответ ученика<textarea data-math-input name="answer" rows="2" maxlength="16000">${esc(answer)}</textarea>${mathPreview(answer)}</label>
         <label class="form-field">Оценка учителя<select name="status">
           <option value="">Оставить предварительную оценку</option>
           ${Object.entries(REVIEWS).map(([value, [label]]) =>
             `<option value="${value}"${teacher.status === value ? ' selected' : ''}>${label}</option>`).join('')}
         </select></label>
-        <label class="form-field">Комментарий учителя<textarea name="explanation" rows="3" maxlength="4000">${esc(teacher.explanation)}</textarea></label>
+        <label class="form-field">Комментарий учителя<textarea data-math-input name="explanation" rows="3" maxlength="4000">${esc(teacher.explanation)}</textarea>${mathPreview(teacher.explanation)}</label>
         <p class="muted small">Изменения сохраняются отдельно. После исправления подтвердите результат заново.</p>
       </form>`;
   }
@@ -986,10 +1045,10 @@
   function clarifyContent() {
     return `
       <form id="clarification-form" class="stack">
-        <p class="page-sub">Добавьте условие, комментарий или недостающие страницы этой работы.</p>
-        <label class="form-field">Текст уточнения<textarea name="text" rows="4" maxlength="4000"></textarea></label>
-        <label class="form-field">Дополнительные файлы<input name="files" type="file" accept="${FILE_TYPES}" multiple></label>
-        ${followupLabel() ? `<p class="muted small">${followupLabel()}</p>` : ''}
+        <p class="page-sub">Текст и файлы получит ученик в Telegram. Сначала подтвердите всю работу.</p>
+        <label class="form-field">Сообщение ученику<textarea name="text" rows="4" maxlength="4000"></textarea></label>
+        <label class="form-field">Файлы для ученика<input name="files" type="file" multiple></label>
+        <p class="muted small">До 10 файлов, каждый до 12 МБ, всего до 20 МБ.</p>
       </form>`;
   }
 
@@ -1029,10 +1088,10 @@
       </div>`;
     } else if (modal.mode === 'clarify') {
       detail = clarifyContent();
-      footer = `<button type="submit" form="clarification-form" class="btn btn-primary btn-block">Отправить уточнение</button>`;
+      footer = `<button type="submit" form="clarification-form" class="btn btn-primary btn-block">Отправить в Telegram</button>`;
     }
     $('#modalTitle').textContent = modal.mode === 'edit' ? 'Исправление результата' :
-      modal.mode === 'clarify' ? 'Уточнение к работе' : workName(state.work);
+      modal.mode === 'clarify' ? 'Сообщение ученику' : workName(state.work);
     body.innerHTML = `${modal.mode === 'clarify' ? '' : previewShell()}${detail}${alert(modal.error, 'modalError')}`;
     if (modal.mode === 'detail') linkExplanationReferences(body);
     $('#modalFoot').innerHTML = footer;
@@ -1351,6 +1410,7 @@
     const labels = {
       no_class: 'Работа не связана с классом.', no_class_code: 'Создайте код Telegram в настройках класса.',
       student_not_linked: 'Ученик не зарегистрирован в боте или ФИО не совпадает.',
+      awaiting_confirmation: 'Подтвердите всю работу, чтобы открыть её ученику.',
       not_scheduled: 'Результат пока не поставлен в очередь.', pending: 'Ожидает отправки.',
       sent: 'Отправлено ученику.', failed: 'Не удалось отправить. Проверьте, что ученик не заблокировал бота.',
       error: 'Не удалось получить состояние отправки.',
@@ -1431,10 +1491,7 @@
         if (questions.length > 30000) throw new Error('Работа слишком большая для одной проверки.');
         body.append('test_questions', questions);
         if (test.subject) {
-          const category = subjectCategory(test);
-          if (!category) throw new Error('Укажите тип предмета в настройках работы.');
           body.append('test_subject', test.subject);
-          body.append('test_subject_category', category);
         }
       }
       const work = await api.request('/v1/submissions', { method: 'POST', body });
@@ -1491,7 +1548,8 @@
     } finally {
       if (session === api.getSession()) {
         state.pending = false;
-        renderActionbar();
+        if (state.screen === 'result') render();
+        else renderActionbar();
       }
       if (state.modal === modal) {
         modalBusy(modal, false);
@@ -1514,6 +1572,7 @@
     const fields = new FormData(form);
     const teacher = task.teacher || {};
     const defaults = {
+      number: Object.hasOwn(teacher, 'number') ? teacher.number : task.recognition.number,
       condition: Object.hasOwn(teacher, 'condition') ? teacher.condition : task.recognition.condition,
       answer: Object.hasOwn(teacher, 'answer') ? teacher.answer : task.recognition.answer,
       explanation: teacher.explanation,
@@ -1524,13 +1583,17 @@
       const after = fields.get(key).trim() || null;
       if (after !== (before || null)) changes[key] = after;
     }
+    if (changes.number && !/^[1-9][0-9]*$/.test(changes.number)) {
+      showError('modalError', 'Укажите номер задания целым числом, начиная с 1.');
+      return;
+    }
     if (!Object.keys(changes).length) {
       showError('modalError', 'Укажите хотя бы одно исправление.');
       return;
     }
     modalMutation(taskPath(task), { method: 'PATCH', body: changes }, result => {
       updateTask(result);
-      toast('Исправление сохранено.');
+      toast(Object.hasOwn(changes, 'number') ? 'Номер сохранён. Перепроверьте задание.' : 'Исправление сохранено.');
     });
   }
 
@@ -1538,10 +1601,12 @@
     const fields = new FormData(form);
     const text = fields.get('text').trim();
     const files = [...form.elements.files.files];
-    const problem = !text && !files.length ? 'Добавьте уточнение или файл.' : invalidFiles(files, state.work.page_count);
+    const problem = !text && !files.length ? 'Добавьте сообщение или файл.' :
+      files.length > 10 || files.some(file => !file.size || file.size > 12 * 1024 * 1024) || files.reduce((sum, file) => sum + file.size, 0) > 20 * 1024 * 1024
+        ? 'Можно отправить до 10 непустых файлов: каждый до 12 МБ, всего до 20 МБ.' : '';
     if (problem) { showError('modalError', problem); return; }
-    const path = `${workPath(state.work)}/clarifications`;
-    modalMutation(path, { method: 'POST', body: fileBody(files, text) }, checkNewWork);
+    const path = `/v1/telegram/submissions/${encodeURIComponent(state.work.id)}/message`;
+    modalMutation(path, { method: 'POST', body: fileBody(files, text) }, () => { closeModal(); toast('Сообщение отправлено в Telegram.'); });
   }
 
   async function submitAuth(form) {
@@ -1776,7 +1841,7 @@
       render();
     },
     'open-unassigned': () => { activeClass = null; setScreen('sheets'); },
-    'open-class': element => { activeClass = element.dataset.id; activeTest = ''; telegramStudentToRemove = null; setScreen('scan'); },
+    'open-class': element => { activeClass = element.dataset.id; activeTest = ''; telegramStudentToRemove = null; telegramStudentsExpanded = false; setScreen('scan'); },
     'edit-student-name': () => { editingStudentName = true; render(); document.querySelector('#student-name-form input')?.focus(); },
     'cancel-student-name': () => { editingStudentName = false; render(); },
     'telegram-refresh-delivery': () => { void refreshTelegramDelivery(screenController.signal); },
@@ -1789,6 +1854,7 @@
       } catch (error) { toast(errorText(error), true); }
     },
     'telegram-ask-remove': element => { telegramStudentToRemove = element.dataset.id; render(); },
+    'telegram-toggle-students': () => { telegramStudentsExpanded = !telegramStudentsExpanded; telegramStudentToRemove = null; render(); },
     'telegram-refresh-class': () => { void refreshTelegramClass(screenController.signal); },
     'telegram-cancel-remove': () => { telegramStudentToRemove = null; render(); },
     'telegram-remove-student': async element => {
@@ -1815,6 +1881,22 @@
         });
         if (session !== api.getSession()) return;
         telegramClassCode = { classId, code: result.code, configured: result.bot_configured, error: '' };
+        try {
+          if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable');
+          await navigator.clipboard.writeText(result.code);
+          toast('Код класса скопирован.');
+        } catch {
+          const helper = document.createElement('textarea');
+          helper.value = result.code;
+          helper.style.cssText = 'position:fixed;left:-9999px;top:0';
+          document.body.append(helper);
+          helper.select();
+          let copied = false;
+          try { copied = document.execCommand('copy'); } catch { /* clipboard may be unavailable */ }
+          helper.remove();
+          toast(copied ? 'Код класса скопирован.' : 'Код создан. Скопируйте его из поля ниже.', !copied);
+        }
+        await refreshTelegramClass(screenController.signal);
       } catch (error) {
         if (session !== api.getSession()) return;
         telegramClassCode = { classId, code: '', error: errorText(error) };
@@ -1822,7 +1904,17 @@
         if (session === api.getSession()) { state.pending = false; if (state.screen === 'scan') render(); }
       }
     },
-    'edit-test': element => { editingTest = element.dataset.id; workspaceError = ''; setScreen('test'); },
+    'edit-test': element => { editingTest = element.dataset.id; questionEdit = null; workspaceError = ''; setScreen('test'); },
+    'edit-question': element => {
+      const test = workspace.tests.find(item => item.id === editingTest);
+      const index = Number(element.dataset.index);
+      if (questionEdit || !Number.isInteger(index) || !test?.questions?.[index]) return;
+      const { question, answer } = test.questions[index];
+      questionEdit = { testId: test.id, index, question, answer, error: '' };
+      render();
+      document.querySelector('#edit-question-form [name=answer]')?.focus();
+    },
+    'cancel-edit-question': () => { const index = questionEdit?.index; questionEdit = null; render(); document.querySelector(`[data-act="edit-question"][data-index="${index}"]`)?.focus({ preventScroll: true }); },
     'cancel-question-import': () => { questionImports.delete(editingTest); render(); },
     'remove-import-question': element => {
       const draft = questionImports.get(editingTest);
@@ -1914,6 +2006,18 @@
     'old-results': () => setScreen('result'),
     filter: element => { state.filter = element.dataset.filter; render(); },
     'open-task': element => openModal('detail', element.dataset.id),
+    'confirm-work': async () => {
+      if (state.pending) return;
+      state.pending = true;
+      render();
+      try {
+        await api.request(`${workPath(state.work)}/confirm`, { method: 'POST' });
+        state.results = await api.request(`${workPath(state.work)}/results`);
+        await refreshTelegramDelivery();
+        toast('Работа подтверждена.');
+      } catch (error) { toast(errorText(error), true); }
+      finally { state.pending = false; render(); }
+    },
     preview: () => openModal('preview'),
     clarify: () => openModal('clarify'),
     'close-modal': () => closeModal(),
@@ -1940,8 +2044,22 @@
       Object.assign(state.modal, { mode: 'detail', error: '' });
       renderModal();
     },
-    recheck: () => {
+    recheck: async () => {
       const task = chosenTask();
+      const modal = state.modal;
+      if (!task || !modal || state.pending) return;
+      state.pending = true;
+      modalBusy(modal, true);
+      try {
+        await ensureWorkspaceSynced();
+      } catch (error) {
+        if (state.modal === modal) showError('modalError', errorText(error));
+        return;
+      } finally {
+        state.pending = false;
+        if (state.modal === modal) modalBusy(modal, false);
+      }
+      if (state.modal !== modal) return;
       modalMutation(`${taskPath(task)}/recheck`, { method: 'POST' }, work => checkNewWork(work, task.id));
     },
     confirm: () => {
@@ -1965,6 +2083,17 @@
   };
 
   document.addEventListener('input', event => {
+    if (questionEdit && ['question', 'answer'].includes(event.target.dataset?.questionEdit)) {
+      questionEdit[event.target.dataset.questionEdit] = event.target.value;
+    }
+    if (event.target.matches?.('[data-math-input]')) {
+      const preview = event.target.closest('label')?.querySelector('[data-math-preview]');
+      if (preview) {
+        const rendered = mathText(event.target.value);
+        preview.hidden = rendered === esc(event.target.value);
+        preview.querySelector('.math-preview-content').innerHTML = rendered;
+      }
+    }
     const field = event.target.dataset?.importField;
     if (!['question', 'answer'].includes(field)) return;
     const index = Number(event.target.dataset.importIndex);
@@ -1987,23 +2116,6 @@
         event.target.value = LEGACY_SUBJECTS.find(([value]) => value === previous)?.[1] || previous || '';
         toast('Не удалось сохранить предмет.', true);
       }
-      const selector = document.getElementById('test-subject-category');
-      if (selector) selector.value = subjectCategory(test);
-    }
-    if (event.target.id === 'test-subject-category') {
-      const test = workspace.tests.find(item => item.id === editingTest);
-      if (!test) return;
-      const known = subjectCatalog.find(item => item.name.toLocaleLowerCase('ru') === String(test.subject || '').trim().toLocaleLowerCase('ru'));
-      const legacy = LEGACY_SUBJECTS.find(([value]) => value === test.subject);
-      const fixedCategory = known?.category || (legacy ? (legacy[0] === 'math' ? 'stem' : 'humanities') : '');
-      if (fixedCategory && event.target.value !== fixedCategory) {
-        event.target.value = fixedCategory;
-        toast('Для этого предмета тип определяется автоматически.', true);
-        return;
-      }
-      const previous = test.subjectCategory;
-      test.subjectCategory = event.target.value;
-      try { saveWorkspace(); } catch { test.subjectCategory = previous; event.target.value = previous || ''; toast('Не удалось сохранить тип предмета.', true); }
     }
   });
 
@@ -2031,7 +2143,7 @@
     finally { if (session === api.getSession()) { state.pending = false; render(); } }
   }
 
-  const formActions = { 'auth-form': submitAuth, 'correction-form': saveCorrection, 'clarification-form': submitClarification, 'workspace-form': addWorkspaceItem, 'question-form': saveQuestion, 'question-photo-form': importQuestionPhoto, 'import-answers-form': saveImportedQuestions, 'profile-form': saveProfile, 'student-name-form': saveStudentName };
+  const formActions = { 'auth-form': submitAuth, 'correction-form': saveCorrection, 'clarification-form': submitClarification, 'workspace-form': addWorkspaceItem, 'question-form': saveQuestion, 'edit-question-form': saveQuestionEdit, 'question-photo-form': importQuestionPhoto, 'import-answers-form': saveImportedQuestions, 'profile-form': saveProfile, 'student-name-form': saveStudentName };
   document.addEventListener('submit', event => {
     const form = event.target;
     if (!Object.hasOwn(formActions, form.id)) return;
