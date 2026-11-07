@@ -1,0 +1,123 @@
+name: stopkadr
+
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql+psycopg://stopkadr:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/stopkadr
+    REDIS_URL: redis://redis:6379/0
+    S3_ENDPOINT_URL: http://objects:9000
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: stopkadr
+      POSTGRES_USER: stopkadr
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes: [pg-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stopkadr -d stopkadr"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  redis:
+    image: redis:8.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  s3-permissions:
+    image: alpine:3.24
+    network_mode: none
+    command: ["sh", "-ec", "chown 10001:10001 /data && chmod 0750 /data"]
+    volumes: [s3-data:/data]
+
+  objects:
+    image: rustfs/rustfs:1.0.4
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY in .env}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY in .env}
+      RUSTFS_CONSOLE_ENABLE: "false"
+      RUSTFS_VOLUMES: /data
+    volumes: [s3-data:/data]
+    depends_on:
+      s3-permissions:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  bucket:
+    <<: *app
+    command: ["python", "-m", "app.storage"]
+    healthcheck:
+      disable: true
+    depends_on:
+      objects:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      bucket:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+    healthcheck:
+      disable: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      bucket:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    stop_grace_period: 60s
+    restart: unless-stopped
+
+  test:
+    profiles: [test]
+    build:
+      context: .
+      target: test
+    command: ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+volumes:
+  pg-data:
+  redis-data:
+  s3-data:

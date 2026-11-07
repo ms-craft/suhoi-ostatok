@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#FBF8F3" />
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#FBF8F3" />
+  <meta name="color-scheme" content="light" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Сухой остаток" />
+  <meta name="description" content="Сухой остаток — сканирование и проверка рукописных работ" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="assets/dry-logo.png" />
+  <link rel="icon" type="image/png" href="assets/dry-logo.png" />
+  <title>Сухой остаток — проверка работ</title>
+  <link rel="stylesheet" href="assets/fonts/fonts.css" />
+  <link rel="stylesheet" href="assets/katex/katex.min.css" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="appbar">
+      <img class="mark" src="assets/dry-logo.png" alt="" width="44" height="44" />
+      <span class="brand"><b>Сухой остаток</b><span id="brandSub">проверка работ</span></span>
+      <span class="grow"></span>
+      <button class="iconbtn" type="button" data-act="billing" aria-label="Подписка" title="Подписка" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M3 10h18M7 15h4"/></svg>
+      </button>
+      <button class="iconbtn" type="button" data-act="logout" aria-label="Выйти" title="Выйти" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 4H5v16h5m4-12 4 4-4 4m-5-4h9"/></svg>
+      </button>
+      <button class="iconbtn" data-act="help" aria-label="Справка" id="helpBtn"></button>
+    </header>
+
+    <main class="main" id="main">
+      <div class="view" id="view"></div>
+    </main>
+
+    <div class="actionbar" id="actionbar" hidden></div>
+  </div>
+
+  <div class="scrim" id="scrim" data-act="close-modal"></div>
+  <div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-hidden="true" inert>
+    <div class="modal-grip"></div>
+    <div class="modal-head">
+      <span class="t" id="modalTitle">Работа ученика</span>
+      <button class="iconbtn" data-act="close-modal" aria-label="Закрыть" id="modalClose"></button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-foot" id="modalFoot"></div>
+  </div>
+
+  <div class="toast-wrap" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+  <script src="assets/katex/katex.min.js"></script>
+  <script src="icons.js"></script>
+  <script src="api.js"></script>
+  <script src="billing.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

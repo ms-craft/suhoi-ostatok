@@ -1,0 +1,14 @@
+{
+  "name": "Сухой остаток — проверка работ",
+  "short_name": "Сухой остаток",
+  "description": "Сканирование и проверка рукописных работ",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#FBF8F3",
+  "theme_color": "#FBF8F3",
+  "lang": "ru",
+  "icons": [
+    { "src": "assets/dry-logo.png", "sizes": "1031x1031", "type": "image/png", "purpose": "any" }
+  ]
+}

@@ -1,0 +1,192 @@
+name: stopkadr-pilot
+
+x-app: &app
+  build:
+    context: ..
+    target: runtime
+  image: stopkadr-pilot-app:${PILOT_RELEASE:?set PILOT_RELEASE}
+  env_file: ${PILOT_APP_ENV_FILE:-pilot.env}
+  entrypoint: ["/bin/sh", "/etc/pilot/app-entrypoint.sh"]
+  volumes:
+    - ./app-entrypoint.sh:/etc/pilot/app-entrypoint.sh:ro
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=256m
+  init: true
+  pids_limit: 128
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: stopkadr
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    entrypoint: ["/bin/sh", "/etc/pilot/postgres-entrypoint.sh"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-entrypoint.sh:/etc/pilot/postgres-entrypoint.sh:ro
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-pilot.sql:ro
+    secrets: [postgres_admin_password, postgres_migration_password, postgres_runtime_password]
+    networks: [data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "stopkadr"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    mem_limit: 768m
+    restart: unless-stopped
+    logging: *logging
+
+  redis:
+    image: redis:8.4-alpine
+    entrypoint: ["/bin/sh", "/etc/pilot/redis-entrypoint.sh"]
+    volumes:
+      - redis-data:/data
+      - ./redis-entrypoint.sh:/etc/pilot/redis-entrypoint.sh:ro
+    secrets: [redis_password]
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$(cat /run/secrets/redis_password) redis-cli --raw ping | grep -qx PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    mem_limit: 384m
+    restart: unless-stopped
+    logging: *logging
+
+  migrate:
+    <<: *app
+    environment:
+      APP_DATABASE_USER: stopkadr_migrator
+    secrets:
+      - source: postgres_migration_password
+        target: database_password
+    networks: [data]
+    command: ["alembic", "upgrade", "head"]
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 384m
+    logging: *logging
+
+  api:
+    <<: *app
+    secrets: &runtime_secrets
+      - source: postgres_runtime_password
+        target: database_password
+      - redis_password
+      - s3_access_key
+      - s3_secret_key
+      - fake_payment_secret
+      - pilot_access_code
+      - pilot_allowed_emails
+      - gemini_api_key
+    networks: [data, edge]
+    command: ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--no-proxy-headers"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health/ready', timeout=4).close()"]
+      interval: 20s
+      timeout: 6s
+      retries: 3
+    mem_limit: 768m
+    restart: unless-stopped
+    logging: *logging
+
+  worker:
+    <<: *app
+    environment:
+      WORKER_HEARTBEAT_PATH: /tmp/worker-heartbeat
+    secrets: *runtime_secrets
+    networks: [data, egress]
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,time; assert time.time()-os.stat('/tmp/worker-heartbeat').st_mtime < 150"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 90s
+    mem_limit: 768m
+    restart: unless-stopped
+    logging: *logging
+
+  site:
+    build:
+      context: ..
+      dockerfile: deploy/site.Dockerfile
+    image: stopkadr-pilot-site:${PILOT_RELEASE:?set PILOT_RELEASE}
+    environment:
+      API_ORIGIN: http://api:8000
+      SITE_HOST: 0.0.0.0
+      SITE_PORT: "5173"
+    networks: [edge]
+    ports: ["127.0.0.1:5173:5173"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    init: true
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173/v1/plans').then(r=>{if(!r.ok) process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    mem_limit: 128m
+    restart: unless-stopped
+    logging: *logging
+
+networks:
+  data:
+    internal: true
+  edge: {}
+  egress: {}
+
+volumes:
+  postgres-data: {}
+  redis-data: {}
+
+secrets:
+  postgres_admin_password:
+    file: ${PILOT_SECRETS_DIR:?set absolute PILOT_SECRETS_DIR}/postgres_admin_password
+  postgres_migration_password:
+    file: ${PILOT_SECRETS_DIR:?set absolute PILOT_SECRETS_DIR}/postgres_migration_password
+  postgres_runtime_password:
+    file: ${PILOT_SECRETS_DIR:?set absolute PILOT_SECRETS_DIR}/postgres_runtime_password
+  redis_password:
+    file: ${PILOT_SECRETS_DIR:?set absolute PILOT_SECRETS_DIR}/redis_password
+  s3_access_key:
+    file: ${PILOT_SECRETS_DIR:?set absolute PILOT_SECRETS_DIR}/s3_access_key
+  s3_secret_key:
+    file: ${PILOT_SECRETS_DIR:?set absolute PILOT_SECRETS_DIR}/s3_secret_key
+  fake_payment_secret:
+    file: ${PILOT_SECRETS_DIR:?set absolute PILOT_SECRETS_DIR}/fake_payment_secret
+  pilot_access_code:
+    file: ${PILOT_SECRETS_DIR:?set absolute PILOT_SECRETS_DIR}/pilot_access_code
+  pilot_allowed_emails:
+    file: ${PILOT_SECRETS_DIR:?set absolute PILOT_SECRETS_DIR}/pilot_allowed_emails
+  gemini_api_key:
+    file: ${PILOT_SECRETS_DIR:?set absolute PILOT_SECRETS_DIR}/gemini_api_key
