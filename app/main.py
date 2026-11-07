@@ -9,7 +9,7 @@ from starlette.exceptions import HTTPException
 from starlette.formparsers import MultiPartException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app import accounts, billing, submissions
+from app import accounts, billing, submissions, subjects
 from app.ai import AIProvider, FakeAIProvider, GeminiAIProvider
 from app.config import Settings, get_settings
 from app.core import ApiError, configure_logging, event, new_id, request_id
@@ -140,13 +140,14 @@ def create_app(
                 settings.gemini_model,
                 api_base=settings.gemini_api_base,
                 recognition_model=settings.gemini_recognition_model,
+                humanities_model=settings.gemini_humanities_model,
             )
         else:
             ai_provider = FakeAIProvider()
     app.state.ai_provider = ai_provider
 
     app.add_middleware(RequestBoundary, max_body=settings.max_request_bytes)
-    for router in (accounts.router, billing.router, submissions.router):
+    for router in (accounts.router, billing.router, submissions.router, subjects.router):
         app.include_router(router, prefix="/v1", responses={
             422: {"model": ErrorEnvelope, "description": "Ошибка валидации запроса"},
             500: {"model": ErrorEnvelope, "description": "Внутренняя ошибка"},

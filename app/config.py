@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     gemini_api_base: str = "https://generativelanguage.googleapis.com/v1beta/models"
     gemini_model: str = "gemini-3.8-flash"
     gemini_recognition_model: str = "gemini-3.5-flash-lite"
+    gemini_humanities_model: str = "gemini-3.8-flash"
     payment_provider: Literal["fake"] = "fake"
     fake_payment_secret: SecretStr | None = None
     plans_json: str | None = None

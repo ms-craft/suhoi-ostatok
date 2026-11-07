@@ -11,6 +11,7 @@ from threading import BoundedSemaphore, Lock
 import pypdfium2 as pdfium
 from fastapi import UploadFile
 from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
 
 from app.config import Settings
 from app.core import ApiError
@@ -24,6 +25,10 @@ PDF_OUTPUT_BYTES = 64 * 1024 * 1024
 JPEG = "image/jpeg"
 PNG = "image/png"
 PDF = "application/pdf"
+HEIC = "image/heic"
+HEIF = "image/heif"
+HEIF_BRANDS = frozenset({b'heic', b'heix', b'heim', b'heis', b'hevc', b'hevx', b'hevm', b'hevs', b'mif1', b'msf1'})
+register_heif_opener(thumbnails=False)
 
 
 @dataclass(frozen=True)
@@ -45,13 +50,14 @@ def render_image(content: bytes, image_format: str, settings: Settings) -> bytes
     try:
         with Image.open(BytesIO(content), formats=[image_format]) as image:
             if image.width * image.height > settings.max_image_pixels:
-                raise ApiError(413, "image_pixel_limit", "Слишком большое изображение.")
+                limit = f'{settings.max_image_pixels:,}'.replace(',', ' ')
+                raise ApiError(413, "image_pixel_limit", f"Размер изображения превышает {limit} пикселей (ширина × высота).")
             if getattr(image, "n_frames", 1) != 1:
                 raise ApiError(415, "unsupported_file", "Поддерживаются только статические изображения.")
             image.verify()
         with Image.open(BytesIO(content), formats=[image_format]) as image:
             return normalized_jpeg(ImageOps.exif_transpose(image), settings.page_image_edge)
-    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as error:
+    except (OSError, ValueError, SyntaxError, EOFError, Image.DecompressionBombError) as error:
         raise invalid_file() from error
 
 
@@ -151,16 +157,22 @@ def prepare_uploads(
     for file in files:
         content = file.file.read(settings.max_file_bytes + 1)
         if len(content) > settings.max_file_bytes:
-            raise ApiError(413, "file_too_large", "Файл превышает допустимый размер.")
+            limit_mb = f'{settings.max_file_bytes / (1024 * 1024):g}'
+            raise ApiError(413, "file_too_large", f"Размер файла превышает {limit_mb} МБ.")
         if content.startswith(b"%PDF-"):
             mime_type = PDF
         elif content.startswith(b"\xff\xd8\xff"):
             mime_type = JPEG
         elif content.startswith(b"\x89PNG\r\n\x1a\n"):
             mime_type = PNG
+        elif len(content) >= 12 and content[4:8] == b'ftyp' and content[8:12] in HEIF_BRANDS:
+            mime_type = HEIF if content[8:12] in {b'mif1', b'msf1'} else HEIC
         else:
-            raise ApiError(415, "unsupported_file", "Поддерживаются JPEG, PNG и PDF.")
-        if file.content_type not in {None, "application/octet-stream", mime_type}:
+            raise ApiError(415, "unsupported_file", "Поддерживаются JPEG, PNG, HEIC, HEIF и PDF.")
+        allowed_types = {None, "application/octet-stream", mime_type}
+        if mime_type in {HEIC, HEIF}:
+            allowed_types.update({HEIC, HEIF})
+        if file.content_type not in allowed_types:
             raise ApiError(415, "unsupported_file", "Тип файла не соответствует его содержимому.")
         if mime_type == PDF:
             if len(files) != 1:
@@ -168,6 +180,7 @@ def prepare_uploads(
             render = render_pilot_pdf if settings.deployment_mode == "pilot" else render_pdf
             pages = render(content, max_pages, settings.page_image_edge)
         else:
-            pages = [render_image(content, "JPEG" if mime_type == JPEG else "PNG", settings)]
+            image_format = {JPEG: 'JPEG', PNG: 'PNG', HEIC: 'HEIF', HEIF: 'HEIF'}[mime_type]
+            pages = [render_image(content, image_format, settings)]
         result.append(PreparedFile(content, mime_type, pages))
     return result

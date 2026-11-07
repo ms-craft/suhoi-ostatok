@@ -35,6 +35,7 @@ class User(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     email: Mapped[str] = mapped_column(String(254), unique=True)
+    full_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -63,7 +64,31 @@ class Credentials(BaseModel):
 
 
 class Registration(Credentials):
+    full_name: str = Field(min_length=2, max_length=160)
     invite_code: SecretStr | None = Field(default=None, max_length=512, repr=False)
+
+    @field_validator("full_name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        name = " ".join(value.split())
+        if len(name) < 2:
+            raise ValueError("Укажите ФИО")
+        return name
+
+
+class ProfileUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    full_name: str = Field(min_length=2, max_length=160)
+
+    @field_validator("full_name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        return Registration.normalize_name(value)
+
+
+class Profile(BaseModel):
+    email: str
+    full_name: str | None
 
 
 class AuthOptions(BaseModel):
@@ -114,6 +139,24 @@ def auth_options(request: Request) -> AuthOptions:
     return AuthOptions(invite_required=request.app.state.settings.deployment_mode == "pilot")
 
 
+@router.get("/auth/profile", response_model=Profile)
+def profile(db: Db, user_id: CurrentUser) -> Profile:
+    user = db.get(User, user_id)
+    if user is None:
+        raise ApiError(401, "authentication_required", "Войдите в аккаунт учителя")
+    return Profile(email=user.email, full_name=user.full_name)
+
+
+@router.patch("/auth/profile", response_model=Profile)
+def update_profile(body: ProfileUpdate, db: Db, user_id: CurrentUser) -> Profile:
+    user = db.get(User, user_id)
+    if user is None:
+        raise ApiError(401, "authentication_required", "Войдите в аккаунт учителя")
+    user.full_name = body.full_name
+    db.commit()
+    return Profile(email=user.email, full_name=user.full_name)
+
+
 @router.post("/auth/register", status_code=201, response_model=AuthResult)
 def register(body: Registration, request: Request, db: Db) -> AuthResult:
     settings = request.app.state.settings
@@ -125,7 +168,7 @@ def register(body: Registration, request: Request, db: Db) -> AuthResult:
             enforce_auth_limit(request, body.email, "enrollment")
         if not permitted or not secrets.compare_digest(code.encode(), expected.encode()):
             raise ApiError(403, "pilot_enrollment_required", "Для участия в пилоте нужно приглашение.")
-    user = User(email=body.email, password_hash=password_hasher.hash(body.password))
+    user = User(email=body.email, full_name=body.full_name, password_hash=password_hasher.hash(body.password))
     db.add(user)
     try:
         db.flush()

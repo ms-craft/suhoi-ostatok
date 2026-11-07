@@ -39,7 +39,7 @@ class Harness:
 
     def register(self, email=None):
         credentials = {"email": email or f"teacher-{uuid4().hex}@example.com", "password": PASSWORD}
-        response = self.client.post("/v1/auth/register", json=credentials)
+        response = self.client.post("/v1/auth/register", json={**credentials, "full_name": "Иван Иванов"})
         assert response.status_code == 201, response.text
         token = response.json()["access_token"]
         return {"Authorization": f"Bearer {token}"}, credentials

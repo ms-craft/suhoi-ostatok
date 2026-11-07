@@ -30,7 +30,12 @@
     return result + plain(text.slice(last));
   }
 
-  const FILE_TYPES = 'image/jpeg,image/png,application/pdf,.jpg,.jpeg,.png,.pdf';
+  const FILE_TYPES = 'image/jpeg,image/png,image/heic,image/heif,application/pdf,.jpg,.jpeg,.png,.heic,.heif,.pdf';
+  const LEGACY_SUBJECTS = [
+    ['math', 'Математика'], ['russian', 'Русский язык'], ['belarusian', 'Белорусский язык'],
+    ['literature', 'Литература'], ['history', 'История'], ['social_studies', 'Обществознание'],
+    ['english', 'Английский язык'], ['other_humanities', 'Другой гуманитарный предмет'],
+  ];
   const PAGE_SIZE = 20;
   const STATUS = { queued: 'В очереди', processing: 'Проверяется', completed: 'Готово', failed: 'Ошибка проверки' };
   const STAGE = {
@@ -51,12 +56,15 @@
     subscription: null, subscriptionError: '',
     works: [], worksOffset: 0, worksLoaded: false, worksLoading: false, worksError: '', hasMore: false,
     work: null, results: null, filter: 'all', checkError: '',
+    profile: null, profileError: '',
     deleteOpen: false, modal: null,
+    sheetDeleteId: null,
   };
   let screenController;
   let pollTimer;
   let disposeBilling;
   let billingBack = 'scan';
+  let profileBack = 'home';
   let subscriptionEpoch = 0;
   let focusBeforeModal;
   let workspace = { classes: [], tests: [], links: {} };
@@ -65,6 +73,8 @@
   let editingTest = '';
   let addingWorkspaceItem = '';
   let workspaceError = '';
+  let subjectCatalog = [];
+  let workspaceDelete = null;
   const workspaceKey = () => `stopkadr.workspace.${api.getSession()?.user_id || ''}`;
   function saveWorkspace() { localStorage.setItem(workspaceKey(), JSON.stringify(workspace)); }
   function loadWorkspace() {
@@ -74,6 +84,7 @@
     } catch { workspace = { classes: [], tests: [], links: {} }; }
     activeClass = null;
     activeTest = '';
+    workspaceDelete = null;
   }
   const newId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
 
@@ -84,7 +95,7 @@
         <input name="name" maxlength="100" required autocomplete="off" placeholder="${kind === 'class' ? 'Например, 5 А' : 'Например, Дроби'}">
       </label>
       ${workspaceError ? `<p class="form-error" role="alert">${esc(workspaceError)}</p>` : ''}
-      <button type="submit" class="btn-primary btn-block">Сохранить</button>
+      <button type="submit" class="btn btn-primary btn-block">Сохранить</button>
       ${btn('cancel-workspace', 'Отмена', 'btn-ghost btn-block')}
     </form>`;
   }
@@ -106,29 +117,117 @@
   }
 
   function viewHome() {
-    return `<div style="padding:6px 2px 16px"><h1 class="page-title">Кабинет учителя</h1>
-      <p class="page-sub">Классы и работы в одном месте.</p></div>
-      <div class="between"><h2>Классы</h2>${btn('add-class', 'Добавить класс', 'btn-ghost btn-sm')}</div>
-      ${workspaceForm('class')}
-      ${workspace.classes.length ? workspace.classes.map(item => `<button type="button" class="card link-row" data-act="open-class" data-id="${esc(item.id)}" style="margin-top:10px"><span class="ico">${icon('list', 19)}</span><span class="who"><b>${esc(item.name)}</b><span>${Object.values(workspace.links).filter(link => link.classId === item.id).length} работ</span></span><span class="chev">${icon('chevRight', 18)}</span></button>`).join('') : '<p class="page-sub">Добавьте класс, чтобы собрать работы учеников.</p>'}
-      <div class="between" style="margin-top:26px"><h2>Работы</h2>${btn('add-test', 'Добавить работу', 'btn-ghost btn-sm')}</div>
-      ${workspaceForm('test')}
-      ${workspace.tests.length ? workspace.tests.map(item => `<button type="button" class="card link-row" data-act="edit-test" data-id="${esc(item.id)}" style="margin-top:8px"><span class="who"><b>${esc(item.name)}</b><span>Заданий: ${Array.isArray(item.questions) ? item.questions.length : 0}</span></span><span class="chev">${icon('chevRight', 18)}</span></button>`).join('') : '<p class="page-sub">Добавьте работу с заданиями и выберите её при загрузке листов.</p>'}
-      <p class="page-sub" style="margin-top:20px">Классы и задания сохраняются в этом браузере.</p>`;
+    const classes = workspace.classes.map(item => {
+      const count = Object.values(workspace.links).filter(link => link.classId === item.id).length;
+      if (workspaceDelete?.kind === 'class' && workspaceDelete.id === item.id) {
+        return `<div class="home-class-confirm" role="alertdialog" aria-labelledby="workspace-delete-title" aria-describedby="class-delete-description">
+          <div id="workspace-delete-title" class="home-class-confirm-title" tabindex="-1">Удалить «${esc(item.name)}»?</div>
+          <p id="class-delete-description">Вместе с классом удалятся листы и результаты: ${count}.</p>
+          <div class="home-class-confirm-actions">
+            <button type="button" class="home-class-confirm-delete" data-act="confirm-delete-workspace" ${state.pending ? 'disabled' : ''}>${state.pending ? 'Удаляем…' : 'Удалить'}</button>
+            <button type="button" class="home-class-confirm-cancel" data-act="cancel-delete-workspace" ${state.pending ? 'disabled' : ''}>Отмена</button>
+          </div>
+        </div>`;
+      }
+      return `<div class="home-class-wrap"><button type="button" class="home-class" data-act="open-class" data-id="${esc(item.id)}">
+        <span class="home-class-top">${icon('folder', 21)}</span>
+        <span class="home-class-name">${esc(item.name)}</span><span class="home-class-count">Работ: ${count}</span>
+      </button><button type="button" class="home-delete home-delete-class" data-act="ask-delete-workspace" data-kind="class" data-id="${esc(item.id)}" aria-label="Удалить класс ${esc(item.name)}">${icon('trash', 17)}</button></div>`;
+    }).join('');
+    const tests = workspace.tests.map(item => workspaceDelete?.kind === 'test' && workspaceDelete.id === item.id
+      ? `<div class="home-work-confirm" role="alertdialog" aria-labelledby="workspace-delete-title" aria-describedby="work-delete-description">
+          <div id="workspace-delete-title" class="home-class-confirm-title" tabindex="-1">Удалить «${esc(item.name)}»?</div>
+          <p id="work-delete-description">Задания и ответы будут удалены. Результаты проверенных листов сохранятся.</p>
+          <div class="home-class-confirm-actions">
+            <button type="button" class="home-class-confirm-delete" data-act="confirm-delete-workspace">Удалить</button>
+            <button type="button" class="home-class-confirm-cancel" data-act="cancel-delete-workspace">Отмена</button>
+          </div>
+        </div>`
+      : `<div class="home-work-wrap"><button type="button" class="home-work" data-act="edit-test" data-id="${esc(item.id)}">
+      <span class="home-work-icon">${icon('folder', 22)}</span><span class="home-work-copy"><b>${esc(item.name)}</b>
+      <span>Заданий: ${Array.isArray(item.questions) ? item.questions.length : 0}</span></span>${icon('chevRight', 18)}</button><button type="button" class="home-delete home-delete-work" data-act="ask-delete-workspace" data-kind="test" data-id="${esc(item.id)}" aria-label="Удалить работу ${esc(item.name)}">${icon('trash', 17)}</button></div>`).join('');
+    const unassigned = Object.values(workspace.links).filter(link => !link.classId).length;
+    return `<div class="teacher-home">
+      <div class="home-intro"><p>Личный кабинет учителя</p><h1>Всё по папкам</h1>
+        <p>Классы, задания и работы учеников — в одном месте.</p></div>
+      <section class="home-section" aria-labelledby="classes-heading">
+        <div class="home-section-head"><div class="home-heading"><h2 id="classes-heading">Мои классы</h2><span>${workspace.classes.length}</span></div>
+          ${btn('add-class', 'Создать класс', 'home-create', 'plus')}</div>
+        ${workspaceForm('class')}
+        ${classes ? `<div class="home-classes">${classes}</div>` : '<div class="home-empty">Добавьте класс, чтобы собирать и проверять работы учеников.</div>'}
+        ${unassigned ? `<button type="button" class="home-unassigned" data-act="open-unassigned">Ранее загруженные листы · ${unassigned} ${icon('chevRight', 16)}</button>` : ''}
+      </section>
+      <section class="home-section" aria-labelledby="works-heading">
+        <div class="home-section-head"><div class="home-heading"><h2 id="works-heading">Мои работы</h2><span>${workspace.tests.length}</span></div>
+          ${btn('add-test', 'Создать работу', 'home-create', 'plus')}</div>
+        ${workspaceForm('test')}
+        ${tests ? `<div class="home-works">${tests}</div>` : '<div class="home-empty">Создайте работу и добавьте к ней задания и ответы.</div>'}
+        <p class="home-note">${icon('info', 16)}<span>Откройте работу, чтобы добавить задания и ответы. Для загрузки листов выберите класс.</span></p>
+      </section>
+    </div>`;
+  }
+
+  function animateWorkspaceList(kind, previousHeight) {
+    const grid = document.querySelector(kind === 'class' ? '.home-classes' : '.home-works');
+    if (!grid || !previousHeight || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    const nextHeight = grid.getBoundingClientRect().height;
+    if (Math.abs(previousHeight - nextHeight) < 1) return;
+    grid.animate([
+      { height: `${previousHeight}px`, overflow: 'clip' },
+      { height: `${nextHeight}px`, overflow: 'clip' },
+    ], { duration: 480, easing: 'cubic-bezier(.22, .61, .36, 1)' });
   }
   function viewTest() {
     const test = workspace.tests.find(item => item.id === editingTest);
     if (!test) return `<p>Работа не найдена.</p>${btn('home', 'На главную', 'btn-ghost')}`;
     const questions = Array.isArray(test.questions) ? test.questions : [];
+    const legacy = LEGACY_SUBJECTS.find(([value]) => value === test.subject);
+    const subjectName = legacy?.[1] || test.subject || '';
+    const category = subjectCategory(test);
     return `${back('home', test.name, 'Задания и правильные ответы')}
-      ${questions.map((q, i) => `<div class="card card-pad" style="margin-bottom:10px"><b>Задание ${i + 1}</b><p style="white-space:pre-wrap">${mathText(q.question)}</p><p class="page-sub">Правильный ответ: ${mathText(q.answer)}</p><button type="button" class="btn-quiet" data-act="remove-question" data-index="${i}">Удалить</button></div>`).join('')}
+      <div class="card card-pad" style="margin-bottom:14px">
+        <label class="form-field">Предмет
+          <input id="test-subject" type="text" list="subject-suggestions" maxlength="100" autocomplete="off" value="${esc(subjectName)}" placeholder="Например, физика или русский язык">
+          <datalist id="subject-suggestions">${subjectCatalog.map(item => `<option value="${esc(item.name)}"></option>`).join('')}</datalist>
+        </label>
+        <label class="form-field" style="margin-top:10px">Тип предмета
+          <select id="test-subject-category"><option value="">Выберите тип</option><option value="stem" ${category === 'stem' ? 'selected' : ''}>Математика и естественные науки</option><option value="humanities" ${category === 'humanities' ? 'selected' : ''}>Гуманитарные предметы и языки</option></select>
+        </label>
+        <p class="page-sub">Выберите подсказку для автоматического определения типа или укажите его вручную для своего предмета.</p>
+      </div>
+      ${questions.length > 1 ? '<p class="question-order-hint">Порядок определяет номера заданий при проверке.</p>' : ''}
+      ${questions.map((q, i) => `<div class="card card-pad question-card" style="margin-bottom:10px">
+        <div class="question-card-head"><b>Задание ${i + 1}</b><div class="question-order" aria-label="Изменить порядок задания ${i + 1}">
+          <button type="button" class="question-move" data-act="move-question" data-index="${i}" data-step="-1" aria-label="Переместить задание ${i + 1} вверх" ${i === 0 ? 'disabled' : ''}>↑</button>
+          <button type="button" class="question-move" data-act="move-question" data-index="${i}" data-step="1" aria-label="Переместить задание ${i + 1} вниз" ${i === questions.length - 1 ? 'disabled' : ''}>↓</button>
+        </div></div><p style="white-space:pre-wrap">${mathText(q.question)}</p><p class="page-sub">Правильный ответ: ${mathText(q.answer)}</p><button type="button" class="btn btn-quiet" data-act="remove-question" data-index="${i}">Удалить</button></div>`).join('')}
       <form id="question-form" class="card card-pad stack">
         <h2>Новое задание</h2>
         <label class="form-field">Условие<textarea name="question" maxlength="8000" required rows="3"></textarea></label>
         <label class="form-field">Правильный ответ<textarea name="answer" maxlength="3000" required rows="2"></textarea></label>
         ${workspaceError ? `<p class="form-error" role="alert">${esc(workspaceError)}</p>` : ''}
-        <button type="submit" class="btn-primary btn-block">Добавить задание</button>
+        <button type="submit" class="btn btn-primary btn-block">Добавить задание</button>
       </form>`;
+  }
+  function subjectCategory(test) {
+    const legacy = LEGACY_SUBJECTS.find(([value]) => value === test.subject);
+    const known = subjectCatalog.find(item => item.name.toLocaleLowerCase('ru') === String(test.subject || '').trim().toLocaleLowerCase('ru'));
+    return known?.category || (legacy ? (legacy[0] === 'math' ? 'stem' : 'humanities') : test.subjectCategory || '');
+  }
+
+  async function loadSubjectCatalog(signal) {
+    try {
+      const result = await api.request('/v1/subjects', { signal });
+      if (signal.aborted) return;
+      subjectCatalog = result;
+      const suggestions = document.getElementById('subject-suggestions');
+      if (suggestions) suggestions.innerHTML = result.map(item => `<option value="${esc(item.name)}"></option>`).join('');
+      const selector = document.getElementById('test-subject-category');
+      const test = workspace.tests.find(item => item.id === editingTest);
+      if (selector && test) selector.value = subjectCategory(test);
+    } catch (error) {
+      if (!signal.aborted) toast('Подсказки предметов недоступны. Можно ввести предмет и выбрать тип вручную.', true);
+    }
   }
   function saveQuestion(form) {
     const test = workspace.tests.find(item => item.id === editingTest);
@@ -147,6 +246,8 @@
     render();
   }
   const selectedPreviews = new Map();
+  const selectedPreviewRequests = new Map();
+  const selectedPreviewErrors = new Map();
   const workPreviews = new Map();
 
   function clearPreviews(cache) {
@@ -155,9 +256,60 @@
   }
 
   function selectedPreview(file) {
+    if (selectedPreviews.has(file)) return selectedPreviews.get(file);
+    if (isHeifFile(file)) return '';
     if (!file.type.startsWith('image/')) return '';
     if (!selectedPreviews.has(file)) selectedPreviews.set(file, URL.createObjectURL(file));
     return selectedPreviews.get(file);
+  }
+
+  const isHeifFile = file => /\.(?:heic|heif)$/i.test(file.name) || ['image/heic', 'image/heif'].includes(file.type);
+
+  function clearSelectedPreviews() {
+    for (const controller of selectedPreviewRequests.values()) controller.abort();
+    selectedPreviewRequests.clear();
+    selectedPreviewErrors.clear();
+    clearPreviews(selectedPreviews);
+  }
+
+  function updateSelectedPreview(file) {
+    const index = state.files.indexOf(file);
+    if (state.screen !== 'scan' || index < 0) return;
+    const holder = document.querySelector(`[data-selected-preview="${index}"]`);
+    const error = document.querySelector(`[data-selected-preview-error="${index}"]`);
+    const url = selectedPreviews.get(file);
+    if (holder && url) {
+      const img = document.createElement('img');
+      img.src = url;
+      img.alt = '';
+      holder.replaceChildren(img);
+    }
+    if (error) error.textContent = selectedPreviewErrors.get(file) || '';
+  }
+
+  function loadSelectedPreviews() {
+    const session = api.getSession();
+    for (const file of state.files) {
+      if (!isHeifFile(file) || selectedPreviews.has(file) || selectedPreviewRequests.has(file) || selectedPreviewErrors.has(file)) continue;
+      const controller = new AbortController();
+      selectedPreviewRequests.set(file, controller);
+      const form = new FormData();
+      form.append('file', file);
+      api.request('/v1/submissions/preview', { method: 'POST', body: form, response: 'blob', signal: controller.signal })
+        .then(blob => {
+          if (controller.signal.aborted || session !== api.getSession() || !state.files.includes(file)) return;
+          selectedPreviews.set(file, URL.createObjectURL(blob));
+        })
+        .catch(error => {
+          if (!controller.signal.aborted && session === api.getSession() && state.files.includes(file)) {
+            selectedPreviewErrors.set(file, errorText(error));
+          }
+        })
+        .finally(() => {
+          if (selectedPreviewRequests.get(file) === controller) selectedPreviewRequests.delete(file);
+          updateSelectedPreview(file);
+        });
+    }
   }
 
   async function loadWorkPreviews() {
@@ -252,6 +404,9 @@
         <p class="page-sub">Войдите, чтобы загрузить и проверить работу ученика.</p>
       </div>
       <form id="auth-form" class="card card-pad stack">
+        ${signup ? `<label class="form-field">Фамилия, имя и отчество
+          <input name="full_name" type="text" autocomplete="name" minlength="2" maxlength="160" required>
+        </label>` : ''}
         <label class="form-field">Электронная почта
           <input name="email" type="email" autocomplete="username" maxlength="254" required value="${esc(state.authEmail)}">
         </label>
@@ -268,6 +423,23 @@
       </form>`;
   }
 
+  function viewProfile() {
+    const profile = state.profile;
+    return `${back(profileBack, 'Аккаунт учителя')}
+      <div class="card card-pad stack">
+        <div><div class="eyebrow">ФИО</div><p>${esc(profile?.full_name || 'Не указано')}</p></div>
+        <div><div class="eyebrow">Электронная почта</div><p>${esc(profile?.email || 'Загружаем…')}</p></div>
+        <form id="profile-form" class="stack-sm">
+          <label class="form-field">${profile?.full_name ? 'Изменить ФИО' : 'Укажите ФИО'}
+            <input name="full_name" type="text" autocomplete="name" minlength="2" maxlength="160" required value="${esc(profile?.full_name || '')}">
+          </label>
+          <button type="submit" class="btn btn-ghost btn-block" ${profile ? '' : 'disabled'}>Сохранить</button>
+        </form>
+        ${alert(state.profileError)}
+        ${btn('logout', 'Выйти из аккаунта', 'btn-ghost btn-block')}
+      </div>`;
+  }
+
   function viewScan() {
     const block = subscriptionBlock();
     const sub = state.subscription;
@@ -275,13 +447,13 @@
       state.worksError ? 'Откройте список, чтобы обновить' : 'Ваши загруженные работы';
     const chosen = state.files.map((file, index) => `
       <li class="file-row between">
-        <span class="selected-file">${selectedPreview(file) ? `<img src="${esc(selectedPreview(file))}" alt="">` : icon('doc', 24)} <span>${esc(file.name)}</span></span>
+        <span class="selected-file"><span class="selected-thumbnail" data-selected-preview="${index}">${selectedPreview(file) ? `<img src="${esc(selectedPreview(file))}" alt="">` : icon('doc', 24)}</span><span>${esc(file.name)}<small class="preview-error" data-selected-preview-error="${index}" role="status">${esc(selectedPreviewErrors.get(file) || '')}</small></span></span>
         <button type="button" class="iconbtn" data-act="remove-file" data-index="${index}"
           aria-label="Убрать файл ${esc(file.name)}" ${state.pending ? 'disabled' : ''}>${icon('x', 17)}</button>
       </li>`).join('');
     return `
       <div style="padding:6px 2px 16px">
-        <button type="button" class="btn-quiet" data-act="home">← Все классы</button>
+        <button type="button" class="btn btn-quiet" data-act="home">← Все классы</button>
         <h1 class="page-title">${esc(workspace.classes.find(item => item.id === activeClass)?.name || 'Работы')}</h1>
         <p class="page-sub">Сфотографируйте листы одной работы — соберём ответы и найдём ошибки.</p>
       </div>
@@ -291,7 +463,7 @@
       <div class="capture">
         <div class="cam">${icon('camera', 28)}</div>
         <div class="cap-title">Сфотографируйте лист</div>
-        <div class="cap-hint">Целиком, при ровном свете · JPG, PNG или PDF</div>
+        <div class="cap-hint">Целиком, при ровном свете · JPG, PNG, HEIC или PDF</div>
         <div class="cap-hint">Имя на снимке будет передано Gemini для распознавания. Проверьте подпись после обработки.</div>
         <div class="cap-actions">
           ${btn('capture', 'Сканировать лист', 'btn-primary', 'camera', state.pending ? 'disabled' : '')}
@@ -312,8 +484,20 @@
   }
 
   function viewSheets() {
-    const cards = state.works.filter(work => workspace.links[work.id]?.classId === activeClass).map(work => `
-      <button type="button" class="sheet-card" data-act="open-sheet" data-id="${esc(work.id)}">
+    const groups = new Map();
+    for (const work of state.works.filter(item => (workspace.links[item.id]?.classId || null) === activeClass)) {
+      const testId = workspace.links[work.id]?.testId || '';
+      if (!groups.has(testId)) groups.set(testId, []);
+      groups.get(testId).push(work);
+    }
+    const sheetCard = work => state.sheetDeleteId === work.id ? `
+      <div class="sheet-delete-confirm" role="alertdialog" aria-labelledby="sheet-delete-title" aria-describedby="sheet-delete-description">
+        <b id="sheet-delete-title" tabindex="-1">Удалить «${esc(workName(work))}»?</b>
+        <p id="sheet-delete-description">Будут удалены все страницы и результаты этой работы.</p>
+        ${btn('confirm-delete-sheet', state.pending ? 'Удаляем…' : 'Удалить', 'btn-primary btn-block', '', state.pending ? 'disabled' : '')}
+        ${btn('cancel-delete-sheet', 'Отмена', 'btn-ghost btn-block', '', state.pending ? 'disabled' : '')}
+      </div>` : `
+      <div class="sheet-card-wrap"><button type="button" class="sheet-card" data-act="open-sheet" data-id="${esc(work.id)}">
         <div class="sheet sheet-placeholder"><img data-work-preview="${esc(work.id)}" alt="Страница работы" loading="lazy"></div>
         <div class="meta">
           <div class="nm">${esc(workName(work))}</div><div class="st">${esc(workspace.tests.find(item => item.id === workspace.links[work.id]?.testId)?.name || 'Без выбранной работы')}</div>
@@ -322,9 +506,13 @@
             ${esc(STATUS[work.status] || '')} · ${esc(work.page_count)} стр.
           </div>
         </div>
-      </button>`).join('');
-    return `${back('scan', 'Листы класса', state.worksLoaded ? `${state.hasMore ? 'Показано' : 'Загружено'} работ: ${state.works.length}` : '')}
-      ${cards ? `<div class="sheet-grid">${cards}</div>` : state.worksLoaded ? empty('Здесь появятся ваши загруженные работы.') : ''}
+      </button><button type="button" class="sheet-delete" data-act="ask-delete-sheet" data-id="${esc(work.id)}" aria-label="Удалить ${esc(workName(work))}" ${state.pending ? 'disabled' : ''}>${icon('trash', 18)}</button></div>`;
+    const grouped = [...groups].map(([id, works]) => {
+      const title = workspace.tests.find(item => item.id === id)?.name || 'Без выбранной работы';
+      return `<section class="sheet-group"><h2>${esc(title)}</h2><div class="sheet-grid">${works.map(sheetCard).join('')}</div></section>`;
+    }).join('');
+    return `${back(activeClass ? 'scan' : 'home', activeClass ? 'Листы класса' : 'Ранее загруженные листы', '')}
+      ${grouped || (state.worksLoaded ? empty('Здесь появятся ваши загруженные работы.') : '')}
       ${state.worksLoading ? '<p class="empty" role="status">Загружаем список работ…</p>' : ''}
       ${alert(state.worksError)}
       ${state.worksError ? btn('reload-works', 'Обновить список', 'btn-ghost btn-block') :
@@ -667,7 +855,7 @@
     if (!modal.objectUrl) loadPreview();
   }
 
-  const VIEWS = { auth: viewAuth, home: viewHome, test: viewTest, scan: viewScan, sheets: viewSheets, check: viewCheck, result: viewResult };
+  const VIEWS = { auth: viewAuth, home: viewHome, profile: viewProfile, test: viewTest, scan: viewScan, sheets: viewSheets, check: viewCheck, result: viewResult };
 
   function focusScreenHeading() {
     const title = $('#view h1');
@@ -678,15 +866,22 @@
 
   function render() {
     const session = api.getSession();
-    for (const action of ['billing', 'logout']) {
+    $('.app').dataset.screen = state.screen;
+    for (const action of ['billing', 'profile']) {
       const button = document.querySelector(`.appbar [data-act="${action}"]`);
       if (button) button.hidden = !session;
+    }
+    const profileButton = document.querySelector('.appbar [data-act="profile"]');
+    if (profileButton) {
+      const initials = (state.profile?.full_name || '').split(/\s+/).filter(Boolean).slice(0, 2).map(part => part[0]).join('').toUpperCase();
+      profileButton.innerHTML = initials ? esc(initials) : icon('user', 20);
     }
     const view = $('#view');
     const restoreHeading = document.activeElement === view.querySelector('h1');
     view.dataset.screen = state.screen;
     if (state.screen !== 'billing') view.innerHTML = VIEWS[state.screen]();
     if (state.screen === 'sheets') void loadWorkPreviews();
+    if (state.screen === 'scan') loadSelectedPreviews();
     if (restoreHeading) focusScreenHeading();
     renderActionbar();
   }
@@ -704,6 +899,7 @@
     screenController = new AbortController();
     const signal = screenController.signal;
     state.screen = api.getSession() ? screen : 'auth';
+    if (state.screen !== 'sheets') state.sheetDeleteId = null;
     state.checkError = '';
     state.deleteOpen = false;
     state.worksLoading = false;
@@ -713,6 +909,10 @@
 
     if (state.screen === 'auth') {
       refreshAuthOptions(signal);
+    } else if (state.screen === 'profile') {
+      refreshProfile(signal);
+    } else if (state.screen === 'test') {
+      loadSubjectCatalog(signal);
     } else if (state.screen === 'scan') {
       refreshSubscription();
       loadWorks(signal);
@@ -732,6 +932,33 @@
     } else if (state.screen === 'result' && reopen && state.results.tasks.some(task => task.id === reopen)) {
       openModal('detail', reopen);
     }
+  }
+
+  async function refreshProfile(signal) {
+    try {
+      const profile = await api.request('/v1/auth/profile', { signal });
+      if (signal.aborted) return;
+      state.profile = profile;
+      state.profileError = '';
+    } catch (error) {
+      if (signal.aborted) return;
+      state.profileError = errorText(error);
+    }
+    if (state.screen === 'profile') render();
+  }
+
+  async function saveProfile(form) {
+    const session = api.getSession();
+    const name = form.elements.full_name.value.trim();
+    if (!name) return;
+    try {
+      const profile = await api.request('/v1/auth/profile', { method: 'PATCH', body: { full_name: name } });
+      if (session !== api.getSession()) return;
+      state.profile = profile;
+      state.profileError = '';
+      render();
+      toast('ФИО сохранено');
+    } catch (error) { state.profileError = errorText(error); render(); }
   }
 
   async function refreshAuthOptions(signal) {
@@ -834,15 +1061,15 @@
 
   const fileKind = file => {
     if (file.type === 'application/pdf') return 'pdf';
-    if (['image/jpeg', 'image/png'].includes(file.type)) return 'photo';
+    if (['image/jpeg', 'image/png', 'image/heic', 'image/heif'].includes(file.type)) return 'photo';
     if (file.type && file.type !== 'application/octet-stream') return '';
     if (/\.pdf$/i.test(file.name)) return 'pdf';
-    if (/\.(?:jpe?g|png)$/i.test(file.name)) return 'photo';
+    if (/\.(?:jpe?g|png|heic|heif)$/i.test(file.name)) return 'photo';
     return '';
   };
 
   function invalidFiles(files, existingPages = 0) {
-    if (files.some(file => !file.size || !fileKind(file))) return 'Выберите непустые файлы JPG, PNG или PDF.';
+    if (files.some(file => !file.size || !fileKind(file))) return 'Выберите непустые файлы JPG, PNG, HEIC, HEIF или PDF.';
     if (files.some(file => fileKind(file) === 'pdf') && files.length > 1) {
       return 'Отправьте один PDF или несколько фотографий одной работы.';
     }
@@ -885,13 +1112,19 @@
         const questions = JSON.stringify(test.questions);
         if (questions.length > 30000) throw new Error('Работа слишком большая для одной проверки.');
         body.append('test_questions', questions);
+        if (test.subject) {
+          const category = subjectCategory(test);
+          if (!category) throw new Error('Укажите тип предмета в настройках работы.');
+          body.append('test_subject', test.subject);
+          body.append('test_subject_category', category);
+        }
       }
       const work = await api.request('/v1/submissions', { method: 'POST', body });
       if (session !== api.getSession()) return;
       workspace.links[work.id] = { classId: activeClass, testId: activeTest };
       saveWorkspace();
       state.files = [];
-      clearPreviews(selectedPreviews);
+      clearSelectedPreviews();
       checkNewWork(work);
       refreshSubscription();
     } catch (error) {
@@ -1003,6 +1236,7 @@
     showError('authError', '');
     try {
       const credentials = { email: state.authEmail, password: fields.get('password') };
+      if (state.authMode === 'register') credentials.full_name = fields.get('full_name').trim();
       if (fields.has('invite_code')) credentials.invite_code = fields.get('invite_code');
       const session = await api.request(`/v1/auth/${state.authMode}`, {
         method: 'POST', auth: false, body: credentials,
@@ -1053,6 +1287,11 @@
         state.pending = false;
         if (removed) {
           state.works = state.works.filter(work => work.id !== target.id);
+          state.worksOffset = Math.max(0, state.worksOffset - 1);
+          if (workPreviews.has(target.id)) URL.revokeObjectURL(workPreviews.get(target.id));
+          workPreviews.delete(target.id);
+          delete workspace.links[target.id];
+          try { saveWorkspace(); } catch { toast('Работа удалена, но не удалось обновить список в браузере.', true); }
           refreshSubscription();
           if (state.work?.id === target.id) {
             state.work = state.results = null;
@@ -1065,13 +1304,149 @@
     }
   }
 
+  async function removeSheet() {
+    const target = state.works.find(work => work.id === state.sheetDeleteId);
+    if (!target || state.pending) return;
+    const session = api.getSession();
+    state.pending = true;
+    render();
+    let removed = false;
+    try {
+      await api.request(workPath(target), { method: 'DELETE' });
+      removed = true;
+    } catch (error) {
+      if (session !== api.getSession()) return;
+      removed = error.code === 'deletion_pending' || error.status === 404;
+      if (!removed) toast(errorText(error), true);
+    } finally {
+      if (session === api.getSession()) {
+        state.pending = false;
+        if (removed) {
+          state.works = state.works.filter(work => work.id !== target.id);
+          state.worksOffset = Math.max(0, state.worksOffset - 1);
+          if (workPreviews.has(target.id)) URL.revokeObjectURL(workPreviews.get(target.id));
+          workPreviews.delete(target.id);
+          delete workspace.links[target.id];
+          try { saveWorkspace(); } catch { toast('Лист удалён, но не удалось обновить список в браузере.', true); }
+          state.sheetDeleteId = null;
+          refreshSubscription();
+        }
+        render();
+      }
+    }
+  }
+
   const actions = {
     home: () => setScreen('home'),
+    profile: () => { if (state.screen !== 'profile') { profileBack = state.screen; state.profileError = ''; setScreen('profile'); } },
     'add-class': () => { addingWorkspaceItem = 'class'; workspaceError = ''; render(); $('#workspace-form input')?.focus(); },
     'add-test': () => { addingWorkspaceItem = 'test'; workspaceError = ''; render(); $('#workspace-form input')?.focus(); },
     'cancel-workspace': () => { addingWorkspaceItem = ''; workspaceError = ''; render(); },
+    'ask-delete-workspace': element => {
+      const kind = element.dataset.kind, id = element.dataset.id;
+      const list = kind === 'class' ? workspace.classes : kind === 'test' ? workspace.tests : [];
+      if (!list.some(item => item.id === id)) return;
+      const previousHeight = document.querySelector(kind === 'class' ? '.home-classes' : '.home-works')?.getBoundingClientRect().height;
+      workspaceDelete = { kind, id };
+      addingWorkspaceItem = '';
+      render();
+      animateWorkspaceList(kind, previousHeight);
+      document.getElementById('workspace-delete-title')?.focus({ preventScroll: true });
+    },
+    'cancel-delete-workspace': () => {
+      const kind = workspaceDelete?.kind;
+      const previousHeight = kind ? document.querySelector(kind === 'class' ? '.home-classes' : '.home-works')?.getBoundingClientRect().height : 0;
+      workspaceDelete = null;
+      render();
+      if (kind) animateWorkspaceList(kind, previousHeight);
+    },
+    'confirm-delete-workspace': async () => {
+      if (!workspaceDelete) return;
+      const { kind, id } = workspaceDelete;
+      const list = kind === 'class' ? workspace.classes : workspace.tests;
+      if (!list.some(item => item.id === id)) { workspaceDelete = null; render(); return; }
+      if (kind === 'class') {
+        const session = api.getSession();
+        const previousHeight = document.querySelector('.home-classes')?.getBoundingClientRect().height;
+        const ids = Object.entries(workspace.links).filter(([, link]) => link.classId === id).map(([workId]) => workId);
+        const removed = [];
+        const failed = [];
+        state.pending = true;
+        render();
+        try {
+          for (const workId of ids) {
+            if (session !== api.getSession()) return;
+            try {
+              await api.request(`/v1/submissions/${encodeURIComponent(workId)}`, { method: 'DELETE' });
+              removed.push(workId);
+            } catch (error) {
+              if (session !== api.getSession()) return;
+              if (error.status === 404 || error.code === 'deletion_pending') removed.push(workId);
+              else failed.push(workId);
+            }
+          }
+          if (session !== api.getSession()) return;
+          const previous = workspace;
+          const links = { ...workspace.links };
+          for (const workId of removed) delete links[workId];
+          workspace = { ...workspace, links,
+            classes: failed.length ? workspace.classes : workspace.classes.filter(item => item.id !== id) };
+          try { saveWorkspace(); } catch {
+            workspace = previous;
+            toast('Не удалось сохранить изменения в браузере. Повторите удаление.', true);
+            return;
+          }
+          state.works = state.works.filter(work => !removed.includes(work.id));
+          state.worksOffset = Math.max(0, state.worksOffset - removed.length);
+          for (const workId of removed) {
+            if (workPreviews.has(workId)) URL.revokeObjectURL(workPreviews.get(workId));
+            workPreviews.delete(workId);
+          }
+          if (failed.length) {
+            toast(`Не удалось удалить листов: ${failed.length}. Класс сохранён; попробуйте снова.`, true);
+          } else {
+            if (activeClass === id) activeClass = null;
+            workspaceDelete = null;
+          }
+          refreshSubscription();
+        } finally {
+          if (session === api.getSession()) { state.pending = false; render(); animateWorkspaceList('class', previousHeight); }
+        }
+        return;
+      }
+      const previous = workspace;
+      const links = Object.fromEntries(Object.entries(workspace.links).map(([workId, link]) => {
+        if (kind === 'test' && link.testId === id) return [workId, { ...link, testId: '' }];
+        return [workId, link];
+      }));
+      workspace = { ...workspace, links,
+        classes: kind === 'class' ? workspace.classes.filter(item => item.id !== id) : workspace.classes,
+        tests: kind === 'test' ? workspace.tests.filter(item => item.id !== id) : workspace.tests };
+      try { saveWorkspace(); } catch { workspace = previous; toast('Не удалось сохранить изменения.', true); return; }
+      if (kind === 'class' && activeClass === id) activeClass = null;
+      if (kind === 'test' && activeTest === id) activeTest = '';
+      workspaceDelete = null;
+      render();
+    },
+    'open-unassigned': () => { activeClass = null; setScreen('sheets'); },
     'open-class': element => { activeClass = element.dataset.id; activeTest = ''; setScreen('scan'); },
     'edit-test': element => { editingTest = element.dataset.id; workspaceError = ''; setScreen('test'); },
+    'move-question': element => {
+      const test = workspace.tests.find(item => item.id === editingTest);
+      const index = Number(element.dataset.index), step = Number(element.dataset.step);
+      if (!test || !Array.isArray(test.questions) || !Number.isInteger(index) || ![-1, 1].includes(step)) return;
+      const target = index + step;
+      if (index < 0 || index >= test.questions.length || target < 0 || target >= test.questions.length) return;
+      const previous = test.questions;
+      const reordered = previous.slice();
+      [reordered[index], reordered[target]] = [reordered[target], reordered[index]];
+      test.questions = reordered;
+      try { saveWorkspace(); } catch { test.questions = previous; toast('Не удалось сохранить порядок.', true); return; }
+      render();
+      const focus = document.querySelector(`[data-act="move-question"][data-index="${target}"][data-step="${step}"]:not(:disabled)`)
+        || document.querySelector(`[data-act="move-question"][data-index="${target}"]:not(:disabled)`);
+      focus?.focus({ preventScroll: true });
+    },
     'remove-question': element => {
       const test = workspace.tests.find(item => item.id === editingTest);
       const index = Number(element.dataset.index);
@@ -1102,6 +1477,9 @@
     gallery: () => $('#gallery-input').click(),
     'remove-file': element => {
       const [file] = state.files.splice(Number(element.dataset.index), 1);
+      selectedPreviewRequests.get(file)?.abort();
+      selectedPreviewRequests.delete(file);
+      selectedPreviewErrors.delete(file);
       if (selectedPreviews.has(file)) URL.revokeObjectURL(selectedPreviews.get(file));
       selectedPreviews.delete(file);
       state.uploadError = '';
@@ -1118,6 +1496,14 @@
       const work = state.works.find(item => item.id === element.dataset.id);
       if (work) checkNewWork(work);
     },
+    'ask-delete-sheet': element => {
+      if (!state.works.some(work => work.id === element.dataset.id)) return;
+      state.sheetDeleteId = element.dataset.id;
+      render();
+      document.getElementById('sheet-delete-title')?.focus({ preventScroll: true });
+    },
+    'cancel-delete-sheet': () => { state.sheetDeleteId = null; render(); },
+    'confirm-delete-sheet': removeSheet,
     'refresh-work': () => {
       state.checkError = '';
       render();
@@ -1179,6 +1565,37 @@
 
   document.addEventListener('change', event => {
     if (event.target.id === 'work-test') activeTest = event.target.value;
+    if (event.target.id === 'test-subject') {
+      const test = workspace.tests.find(item => item.id === editingTest);
+      if (!test) return;
+      const previous = test.subject, previousCategory = test.subjectCategory;
+      test.subject = event.target.value.trim();
+      const known = subjectCatalog.find(item => item.name.toLocaleLowerCase('ru') === test.subject.toLocaleLowerCase('ru'));
+      test.subjectCategory = known?.category || '';
+      try { saveWorkspace(); } catch {
+        test.subject = previous;
+        test.subjectCategory = previousCategory;
+        event.target.value = LEGACY_SUBJECTS.find(([value]) => value === previous)?.[1] || previous || '';
+        toast('Не удалось сохранить предмет.', true);
+      }
+      const selector = document.getElementById('test-subject-category');
+      if (selector) selector.value = subjectCategory(test);
+    }
+    if (event.target.id === 'test-subject-category') {
+      const test = workspace.tests.find(item => item.id === editingTest);
+      if (!test) return;
+      const known = subjectCatalog.find(item => item.name.toLocaleLowerCase('ru') === String(test.subject || '').trim().toLocaleLowerCase('ru'));
+      const legacy = LEGACY_SUBJECTS.find(([value]) => value === test.subject);
+      const fixedCategory = known?.category || (legacy ? (legacy[0] === 'math' ? 'stem' : 'humanities') : '');
+      if (fixedCategory && event.target.value !== fixedCategory) {
+        event.target.value = fixedCategory;
+        toast('Для этого предмета тип определяется автоматически.', true);
+        return;
+      }
+      const previous = test.subjectCategory;
+      test.subjectCategory = event.target.value;
+      try { saveWorkspace(); } catch { test.subjectCategory = previous; event.target.value = previous || ''; toast('Не удалось сохранить тип предмета.', true); }
+    }
   });
 
   document.addEventListener('click', event => {
@@ -1190,7 +1607,7 @@
     actions[action](element);
   });
 
-  const formActions = { 'auth-form': submitAuth, 'correction-form': saveCorrection, 'clarification-form': submitClarification, 'workspace-form': addWorkspaceItem, 'question-form': saveQuestion };
+  const formActions = { 'auth-form': submitAuth, 'correction-form': saveCorrection, 'clarification-form': submitClarification, 'workspace-form': addWorkspaceItem, 'question-form': saveQuestion, 'profile-form': saveProfile };
   document.addEventListener('submit', event => {
     const form = event.target;
     if (!Object.hasOwn(formActions, form.id)) return;
@@ -1213,7 +1630,6 @@
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
   });
 
-  $('#helpBtn').innerHTML = icon('help', 20);
   $('#modalClose').innerHTML = icon('x', 20);
   $('#modal').inert = true;
   $('#modal').setAttribute('aria-hidden', 'true');
@@ -1224,7 +1640,7 @@
     const input = document.createElement('input');
     input.id = camera ? 'capture-input' : 'gallery-input';
     input.type = 'file';
-    input.accept = camera ? 'image/jpeg,image/png' : FILE_TYPES;
+    input.accept = camera ? 'image/jpeg,image/png,image/heic,image/heif' : FILE_TYPES;
     if (camera) input.setAttribute('capture', 'environment');
     else input.multiple = true;
     input.hidden = true;
@@ -1234,7 +1650,7 @@
 
   api.onSessionChange((session, reason) => {
     subscriptionEpoch++;
-    clearPreviews(selectedPreviews);
+    clearSelectedPreviews();
     clearPreviews(workPreviews);
     Object.assign(state, {
       authMode: 'login', authEmail: '',
@@ -1243,6 +1659,8 @@
       subscription: null, subscriptionError: '',
       works: [], worksOffset: 0, worksLoaded: false, worksLoading: false, worksError: '', hasMore: false,
       work: null, results: null,
+      sheetDeleteId: null,
+      profile: null, profileError: '',
     });
     $('#toasts').replaceChildren();
     if (session) loadWorkspace();

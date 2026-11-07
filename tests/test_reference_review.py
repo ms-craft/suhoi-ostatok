@@ -52,7 +52,7 @@ def test_reference_match_skips_model_and_mismatch_keeps_teacher_answer(monkeypat
     tasks = [RecognizedTask(page_number=1, number="1", answer="КОМАР", answer_state="present"),
              RecognizedTask(page_number=1, number="2", answer="камар", answer_state="present")]
     refs = [{"question": "Слово 1", "answer": "комар"}, {"question": "Слово 2", "answer": "комар"}]
-    monkeypatch.setattr(work, "_load_inputs", lambda *a: ([], [], None, refs))
+    monkeypatch.setattr(work, "_load_inputs", lambda *a: ([], [], None, refs, None, None))
     monkeypatch.setattr(work, "_source_pages", lambda *a: [])
     monkeypatch.setattr(work, "_stage", lambda *a: None)
     monkeypatch.setattr(work, "validate_recognition", lambda *a: tasks)

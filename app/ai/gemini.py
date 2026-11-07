@@ -15,6 +15,7 @@ from .contracts import AIError, AIRecord, PageInput, PreliminaryReview, Recogniz
 from .review import local_review, validate_reviews
 
 DEFAULT_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+HUMANITIES_SUBJECTS = {"russian", "belarusian", "literature", "history", "social_studies", "english", "other_humanities"}
 INLINE_BYTES = 12 * 1024 * 1024
 PAGES_PER_REQUEST = 8
 REVIEWS_PER_REQUEST = 20
@@ -137,14 +138,18 @@ class GeminiAIProvider:
     demonstration = False
 
     def __init__(self, api_key: str, model: str = "gemini-3.8-flash",
-                 api_base: str = DEFAULT_API_BASE, recognition_model: str | None = None):
+                 api_base: str = DEFAULT_API_BASE, recognition_model: str | None = None,
+                 humanities_model: str = "gemini-3.8-flash"):
         if not api_key.strip() or not re.fullmatch(r"gemini-[a-zA-Z0-9.-]{1,80}", model):
             raise AIError("ai_configuration")
         if recognition_model and not re.fullmatch(r"gemini-[a-zA-Z0-9.-]{1,80}", recognition_model):
             raise AIError("ai_configuration")
+        if not re.fullmatch(r"gemini-[a-zA-Z0-9.-]{1,80}", humanities_model):
+            raise AIError("ai_configuration")
         self._api_key = api_key.strip()
         self.model = model
         self.recognition_model = recognition_model or model
+        self.humanities_model = humanities_model
         self._api_base = api_base.rstrip("/")
         self._openai_compatible = (
             "generativelanguage.googleapis.com" not in self._api_base
@@ -158,10 +163,16 @@ class GeminiAIProvider:
         return self.recognize_with_name(pages, clarification)[0]
 
     def recognize_with_name(
-        self, pages: list[PageInput], clarification: str | None
+        self, pages: list[PageInput], clarification: str | None, subject: str | None = None,
+        subject_category: str | None = None,
     ) -> tuple[list[RecognizedTask], str | None]:
         tasks = []
         names = set()
+        is_humanities = subject_category == 'humanities' or (subject_category is None and subject in HUMANITIES_SUBJECTS)
+        recognition_model = self.humanities_model if is_humanities else self.recognition_model
+        instructions = RECOGNITION_INSTRUCTIONS
+        if is_humanities:
+            instructions += "\nОсобенно внимательно распознавай каждую букву, включая согласные; сохраняй ошибки ученика и не исправляй их. При сомнении отмечай ambiguity."
         for group in _page_groups(pages):
             if self._openai_compatible:
                 content: list[dict] = []
@@ -177,7 +188,7 @@ class GeminiAIProvider:
                     })
                 response = self._request_openai(
                     "recognize",
-                    RECOGNITION_INSTRUCTIONS + (
+                    instructions + (
                         '\nФормат ответа JSON:\n'
                         '{"student_name": "Имя Фамилия или null", "tasks": [{"page_number": 1, "number": "1", "condition": "...", '
                         '"answer": "...", "answer_state": "present", "kind": "arithmetic", '
@@ -186,6 +197,7 @@ class GeminiAIProvider:
                     ),
                     content,
                     _RecognitionResponse,
+                    model_override=recognition_model,
                 )
             else:
                 parts = [{"text": json.dumps({"teacher_clarification": clarification}, ensure_ascii=False)}]
@@ -198,7 +210,7 @@ class GeminiAIProvider:
                         }}
                     )
                 response = self._request(
-                    "recognize", RECOGNITION_INSTRUCTIONS, parts, _RecognitionResponse
+                    "recognize", instructions, parts, _RecognitionResponse, model_override=recognition_model
                 )
             # Gemini localization is unverified for handwritten answers. Use page links.
             group_tasks = [task.model_copy(update={"region": None}) for task in response.tasks]
@@ -292,6 +304,7 @@ class GeminiAIProvider:
         instructions: str,
         parts: list[dict],
         response_type: type[ResponseModel],
+        model_override: str | None = None,
     ) -> ResponseModel:
         start = perf_counter()
         http_status = None
@@ -299,7 +312,7 @@ class GeminiAIProvider:
         usage = {}
         try:
             response = httpx.post(
-                f"{self._api_base}/{self.recognition_model if stage == 'recognize' else self.model}:generateContent",
+                f"{self._api_base}/{model_override or (self.recognition_model if stage == 'recognize' else self.model)}:generateContent",
                 headers={"x-goog-api-key": self._api_key},
                 timeout=httpx.Timeout(45, connect=5),
                 json={
@@ -351,7 +364,7 @@ class GeminiAIProvider:
                 component="ai",
                 stage=stage,
                 provider=self.name,
-                model=self.recognition_model if stage == "recognize" else self.model,
+                model=model_override or (self.recognition_model if stage == "recognize" else self.model),
                 duration_ms=round((perf_counter() - start) * 1000),
                 http_status=http_status,
                 status="failed" if error_code else "completed",
@@ -381,6 +394,7 @@ class GeminiAIProvider:
         instructions: str,
         user_content: str | list[dict],
         response_type: type[ResponseModel],
+        model_override: str | None = None,
     ) -> ResponseModel:
         start = perf_counter()
         http_status = None
@@ -396,7 +410,7 @@ class GeminiAIProvider:
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 timeout=httpx.Timeout(45, connect=5),
                 json={
-                    "model": self.recognition_model if stage == "recognize" else self.model,
+                    "model": model_override or (self.recognition_model if stage == "recognize" else self.model),
                     "messages": [
                         {"role": "system", "content": instructions},
                         {"role": "user", "content": user_content},
@@ -438,7 +452,7 @@ class GeminiAIProvider:
                 component="ai",
                 stage=stage,
                 provider=self.name,
-                model=self.recognition_model if stage == "recognize" else self.model,
+                model=model_override or (self.recognition_model if stage == "recognize" else self.model),
                 duration_ms=round((perf_counter() - start) * 1000),
                 http_status=http_status,
                 status="failed" if error_code else "completed",

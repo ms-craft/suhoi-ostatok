@@ -1,10 +1,12 @@
 from datetime import datetime
+from io import BytesIO
 import json
 from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
+from PIL import Image
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
@@ -13,7 +15,7 @@ from app.ai import PreliminaryReview, RecognizedTask, ReviewStatus
 from app.billing import entitlement, reserve_check, settle_check
 from app.core import ApiError, as_utc, event, new_id, request_id, utcnow
 from app.db import get_db
-from app.files import JPEG, PreparedFile, page_limit, prepare_uploads
+from app.files import HEIC, HEIF, JPEG, PreparedFile, normalized_jpeg, page_limit, prepare_uploads
 from app.object_lock import lock_object_writer
 from app.submission_models import DetectedTask, ProcessingJob, SourceFile, Submission, SubmissionPage, TeacherEdit
 
@@ -280,14 +282,37 @@ def save_uploads(db: Session, state, row: Submission, files: list[PreparedFile])
         raise ApiError(503, "upload_unavailable", "Подтверждение загрузки временно недоступно.") from error
 
 
+@router.post('/preview', response_class=Response)
+def preview_heic(request: Request, user_id: Owner, file: Annotated[UploadFile, File()]):
+    if file.content_type not in {None, 'application/octet-stream', HEIC, HEIF}:
+        raise ApiError(415, 'unsupported_file', 'Для предпросмотра выберите HEIC или HEIF.')
+    prepared = prepare_uploads([file], request.app.state.settings, max_pages=1)
+    if prepared[0].mime_type not in {HEIC, HEIF}:
+        raise ApiError(415, 'unsupported_file', 'Для предпросмотра выберите HEIC или HEIF.')
+    with Image.open(BytesIO(prepared[0].pages[0]), formats=['JPEG']) as image:
+        thumbnail = normalized_jpeg(image, 480)
+    return Response(thumbnail, media_type=JPEG,
+                    headers={'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff'})
+
+
 @router.post("", status_code=202, response_model=SubmissionView)
 def upload(
     request: Request, db: DB, user_id: Owner,
     files: Annotated[list[UploadFile] | None, File()] = None,
     test_questions: Annotated[str | None, Form(max_length=30000)] = None,
+    test_subject: Annotated[str | None, Form(max_length=100)] = None,
+    test_subject_category: Annotated[Literal['stem', 'humanities'] | None, Form()] = None,
     student_reference: Annotated[str | None, Form(max_length=120)] = None,
 ):
     state = request.app.state
+    test_subject = test_subject.strip() if test_subject else None
+    if test_subject:
+        from app.subjects import Subject
+        known = next((item for item in db.scalars(select(Subject)).all() if item.name.casefold() == test_subject.casefold()), None)
+        legacy = {'math': 'stem', 'russian': 'humanities', 'belarusian': 'humanities', 'literature': 'humanities', 'history': 'humanities', 'social_studies': 'humanities', 'english': 'humanities', 'other_humanities': 'humanities'}
+        test_subject_category = known.category if known else legacy.get(test_subject, test_subject_category)
+        if not test_subject_category:
+            raise ApiError(422, 'subject_category_required', 'Укажите тип предмета для выбранной работы.')
     references = []
     if test_questions:
         try:
@@ -309,7 +334,8 @@ def upload(
     db.add(row)
     db.flush()
     enqueue(db, row, "initial", reservation_id=reservation, job_id=job_id,
-            clarification=json.dumps(references, ensure_ascii=False) if references else None)
+            clarification=json.dumps({'questions': references, 'subject': test_subject, 'subject_category': test_subject_category}, ensure_ascii=False)
+            if references or test_subject else None)
     save_uploads(db, state, row, prepared)
     event("submission_uploaded", submission_id=row.id, user_id=user_id, job_id=job_id,
           page_count=row.page_count)

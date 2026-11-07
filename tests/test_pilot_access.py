@@ -51,10 +51,10 @@ def test_invitation_is_required_for_allowed_address(harness, enrollment):
         {**credentials, "invite_code": "incorrect"},
         {**credentials, "email": "unlisted@example.invalid", "invite_code": code},
     ):
-        response = harness.client.post("/v1/auth/register", json=payload)
+        response = harness.client.post("/v1/auth/register", json={**payload, "full_name": "Иван Иванов"})
         assert response.status_code == 403
         assert response.json()["error"]["code"] == "pilot_enrollment_required"
-    registered = harness.client.post("/v1/auth/register", json={**credentials, "invite_code": code})
+    registered = harness.client.post("/v1/auth/register", json={**credentials, "invite_code": code, "full_name": "Иван Иванов"})
     assert registered.status_code == 201, registered.text
     assert harness.client.post("/v1/auth/login", json=credentials).status_code == 200
     auth = {"Authorization": f"Bearer {registered.json()['access_token']}"}
@@ -75,7 +75,7 @@ def test_rate_limit_applies_across_requests_and_hides_address(harness, enrollmen
     assert response.json()["error"]["code"] == "auth_rate_limited"
     key, = harness.app.state.queue.client.keys
     assert credentials["email"] not in key and code not in key
-    assert harness.client.post("/v1/auth/register", json={**credentials, "invite_code": code}).status_code == 201
+    assert harness.client.post("/v1/auth/register", json={**credentials, "invite_code": code, "full_name": "Иван Иванов"}).status_code == 201
 
 
 def test_pilot_auth_fails_closed_without_redis(harness, enrollment, monkeypatch):

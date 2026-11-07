@@ -139,7 +139,7 @@ def _stage(state, claim: Claim, name: str) -> None:
     event("job_stage_started", stage=name)
 
 
-def _load_inputs(state, claim: Claim) -> tuple[list, list[InputTask], str | None, list]:
+def _load_inputs(state, claim: Claim) -> tuple[list, list[InputTask], str | None, list, str | None, str | None]:
     with state.session_factory() as db:
         pages = db.execute(
             select(SubmissionPage.number, SubmissionPage.object_key)
@@ -161,12 +161,17 @@ def _load_inputs(state, claim: Claim) -> tuple[list, list[InputTask], str | None
         ).order_by(ProcessingJob.created_at.asc()).limit(1))
     clarification = "\n\n".join(reversed(notes))[-4000:] if notes else None
     try:
-        references = json.loads(initial) if initial else []
+        metadata = json.loads(initial) if initial else []
+        subject = metadata.get('subject') if isinstance(metadata, dict) else None
+        subject_category = metadata.get('subject_category') if isinstance(metadata, dict) else None
+        references = metadata.get('questions', []) if isinstance(metadata, dict) else metadata
         if not isinstance(references, list):
             references = []
     except (ValueError, TypeError):
         references = []
-    return pages, tasks, clarification, references
+        subject = None
+        subject_category = None
+    return pages, tasks, clarification, references, subject, subject_category
 
 
 def _source_pages(state, pages: list) -> list[PageInput]:
@@ -226,7 +231,7 @@ def _match_tasks(recognition: list[RecognizedTask], previous: list[InputTask]) -
 
 
 def _analyze(state, claim: Claim) -> list[Analysis]:
-    pages, existing, clarification, references = _load_inputs(state, claim)
+    pages, existing, clarification, references, subject, subject_category = _load_inputs(state, claim)
     provider = state.ai_provider
     student_name = None
     if claim.kind == "recheck":
@@ -238,7 +243,7 @@ def _analyze(state, claim: Claim) -> list[Analysis]:
         source = _source_pages(state, pages)
         _stage(state, claim, "recognition")
         if hasattr(provider, "recognize_with_name"):
-            found, student_name = provider.recognize_with_name(source, clarification)
+            found, student_name = provider.recognize_with_name(source, clarification, subject=subject, subject_category=subject_category)
         else:
             found = provider.recognize(source, clarification)
         recognition = validate_recognition(found, source)
