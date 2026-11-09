@@ -109,7 +109,7 @@ if (-not $alreadyRunning) {
     $env:GEMINI_API_KEY = $savedGemini
     $env:TELEGRAM_BOT_TOKEN = $savedTelegram
   }
-  [pscustomobject]@{ pid=$process.Id; path=$process.Path; started=$process.StartTime.ToUniversalTime().Ticks.ToString(); address=$Address; port=5174 } |
+  [pscustomobject]@{ pid=$process.Id; path=(Get-Item -LiteralPath $node).FullName; started=$process.StartTime.ToUniversalTime().Ticks.ToString(); address=$Address; port=5174 } |
     ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath $registry
   $ready = $false
   for ($attempt = 0; $attempt -lt 15; $attempt++) {

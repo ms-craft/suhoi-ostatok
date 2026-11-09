@@ -1,6 +1,7 @@
 from app.ai import FakeAIProvider, PreliminaryReview, RecognizedTask
 from app.telegram_bot import deliver_pending, dispatch, dispatch_callback, register
 from tests.support import photograph
+import pytest
 
 
 def class_code(harness, auth, reference, *, name='7 А', submission_ids=None):
@@ -54,6 +55,41 @@ def test_polling_timeout_is_sent_separately_from_http_timeout(monkeypatch):
     assert call_telegram('test', 'getUpdates', http_timeout=15, timeout=5)['ok']
     assert captured['json']['timeout'] == 5
     assert captured['timeout'].read == 15
+
+
+@pytest.mark.parametrize(('failure', 'expected'), [
+    (None, ['sendRichMessage']),
+    ('telegram_http_400', ['sendRichMessage', 'sendMessage']),
+    ('telegram_http_404', ['sendRichMessage', 'sendMessage']),
+])
+def test_result_uses_rich_message_with_readable_fallback(monkeypatch, failure, expected):
+    from app.telegram_bot import TelegramError, send_result_part
+    calls = []
+    def call(token, method, **kwargs):
+        calls.append((method, kwargs))
+        if method == 'sendRichMessage' and failure:
+            raise TelegramError(failure)
+        return {'ok': True}
+    monkeypatch.setattr('app.telegram_bot.call_telegram', call)
+    keyboard = {'inline_keyboard': [[{'text': 'Назад', 'callback_data': 'page:0'}]]}
+    send_result_part('test', 101, r'<p><tg-math>\frac{1}{2}</tg-math></p>', keyboard)
+    assert [method for method, _ in calls] == expected
+    assert calls[0][1]['rich_message']['html'] == r'<p><tg-math>\frac{1}{2}</tg-math></p>'
+    if failure:
+        assert calls[1][1]['text'] == '(1)/(2)'
+        assert calls[1][1]['reply_markup'] == keyboard
+
+
+def test_result_does_not_retry_ambiguous_network_failure(monkeypatch):
+    from app.telegram_bot import TelegramError, send_result_part
+    calls = []
+    def call(token, method, **kwargs):
+        calls.append(method)
+        raise TelegramError('telegram_unavailable')
+    monkeypatch.setattr('app.telegram_bot.call_telegram', call)
+    with pytest.raises(TelegramError):
+        send_result_part('test', 101, '<p>Работа</p>')
+    assert calls == ['sendRichMessage']
 
 
 def test_bot_starts_without_gemini_credentials(monkeypatch):
@@ -121,7 +157,7 @@ def test_checked_work_and_teacher_edit_delivered_only_to_matching_student(build_
     assert sent and all(item['chat_id'] == 101 for item in sent)
     dispatch_callback('test', {'id': 'cb', 'from': {'id': 101}, 'message': {'chat': {'id': 101, 'type': 'private'}},
                                'data': f"work:{submission['id']}:0"}, factory)
-    text = '\n'.join(item.get('text', '') for item in sent)
+    text = '\n'.join(item.get('text', '') or item.get('rich_message', {}).get('html', '') for item in sent).replace('<br>', '\n')
     assert '<b>Ваш ответ</b>\nкамар' in text
     assert '<b>Ответ учителя</b>\nкомар' in text
     assert '<blockquote>камар</blockquote>' in text
@@ -139,7 +175,7 @@ def test_checked_work_and_teacher_edit_delivered_only_to_matching_student(build_
     deliver_pending('test', factory)
     dispatch_callback('test', {'id': 'cb', 'from': {'id': 101}, 'message': {'chat': {'id': 101, 'type': 'private'}},
                                'data': f"work:{submission['id']}:0"}, factory)
-    text = '\n'.join(item.get('text', '') for item in sent[old_count:])
+    text = '\n'.join(item.get('text', '') or item.get('rich_message', {}).get('html', '') for item in sent[old_count:]).replace('<br>', '\n')
     assert '<b>Ваш ответ</b>\nкомар' in text
     assert '<b>Первоначальное распознавание</b>\nкамар' in text
     assert '<b>Ответ учителя</b>\nкомар' in text

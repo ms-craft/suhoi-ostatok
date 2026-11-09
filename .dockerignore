@@ -8,3 +8,4 @@
 .coverage
 .local-verify
 .local-run
+*.zip

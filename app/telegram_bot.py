@@ -18,7 +18,7 @@ from app.db import make_session_factory
 from app.submission_models import DetectedTask, Submission, TaskAnalysis
 from app.telegram_access import fully_confirmed, name_key, schedule_submission, valid_name
 from app.telegram_models import TelegramBinding, TelegramClass, TelegramDelivery
-from app.telegram_notifier import format_result
+from app.telegram_notifier import format_result, rich_to_plain
 from app.workspace import TeacherWorkspace
 
 logging.getLogger('httpx').setLevel(logging.WARNING)
@@ -137,13 +137,10 @@ def dispatch_callback(token, callback, db_factory):
                                .order_by(DetectedTask.position)).all()
             details = _task_data(db, tasks)
             submission = {'created_at': row.created_at.isoformat(), 'title': name, 'class_name': cls.name}
-            messages = format_result(submission, details)
+            messages = format_result(submission, details, rich=True)
         for index, text in enumerate(messages):
             keyboard = {'inline_keyboard': [[{'text': '← Мои работы', 'callback_data': f'page:{parts[2]}'}]]} if index == len(messages)-1 else None
-            payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
-            if keyboard:
-                payload['reply_markup'] = keyboard
-            call_telegram(token, 'sendMessage', **payload)
+            send_result_part(token, chat_id, text, keyboard)
 
 
 class TelegramError(Exception):
@@ -162,6 +159,21 @@ def call_telegram(token: str, method: str, *, http_timeout: float = 20, **payloa
         return data
     except (httpx.RequestError, ValueError) as error:
         raise TelegramError('telegram_unavailable') from error
+
+
+def send_result_part(token: str, chat_id: int, text: str, keyboard: dict | None = None) -> None:
+    payload = {'chat_id': chat_id, 'rich_message': {'html': text, 'skip_entity_detection': True}}
+    if keyboard:
+        payload['reply_markup'] = keyboard
+    try:
+        call_telegram(token, 'sendRichMessage', **payload)
+    except TelegramError as error:
+        if str(error) not in {'telegram_http_400', 'telegram_http_404'}:
+            raise
+        fallback = {'chat_id': chat_id, 'text': rich_to_plain(text), 'parse_mode': 'HTML'}
+        if keyboard:
+            fallback['reply_markup'] = keyboard
+        call_telegram(token, 'sendMessage', **fallback)
 
 
 def reply(token: str, chat_id: int, text: str) -> None:

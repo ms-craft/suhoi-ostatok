@@ -93,6 +93,22 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  site:
+    image: node:22-alpine
+    working_dir: /srv/site
+    user: node
+    command: ["node", "serve.js"]
+    environment:
+      API_ORIGIN: http://api:8000
+      SITE_HOST: 0.0.0.0
+      SITE_PORT: "5173"
+    ports: ["127.0.0.1:5173:5173"]
+    volumes: ["./site:/srv/site:ro"]
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
   worker:
     <<: *app
     command: ["python", "-m", "app.worker"]

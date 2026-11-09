@@ -1,4 +1,4 @@
-from app.telegram_notifier import format_result
+from app.telegram_notifier import format_result, rich_to_plain
 
 
 def test_message_distinguishes_corrected_student_and_teacher_answers():
@@ -61,3 +61,31 @@ def test_stale_review_is_not_presented_as_current_after_an_edit():
     assert 'Ответ верен.' not in text
     assert '<b>Ваш ответ</b>\nx = 21' in text
     assert '<b>Первоначальное распознавание</b>\nx = 2' in text
+
+
+def test_rich_result_preserves_delimited_latex_and_escapes_user_text():
+    task = {'recognition': {'answer': r'Решение: $x^2 + \frac{1}{2}$ и \(\sqrt{x}\) <tag>'},
+            'preliminary': {'status': 'incorrect', 'expected_answer': r'$$\frac{3}{4}$$',
+                            'expected_answer_source': 'teacher_test',
+                            'explanation': r'Получается \frac{x_{1}}{2}. Также x_1 \cdot x_2 = 3.'}}
+    text = '\n'.join(format_result({}, [task], rich=True))
+    assert r'<tg-math>x^2 + \frac{1}{2}</tg-math>' in text
+    assert r'<tg-math>\sqrt{x}</tg-math>' in text
+    assert r'<tg-math>\frac{3}{4}</tg-math>' in text
+    assert r'<tg-math>\frac{x_{1}}{2}</tg-math>' in text
+    assert '<tg-math>x_1</tg-math> · <tg-math>x_2</tg-math>' in text
+    assert '&lt;tag&gt;' in text
+    assert '<tag>' not in text
+
+
+def test_rich_formulas_are_not_split_at_message_boundary_and_fallback_is_safe():
+    answer = ('а' * 2950) + r' $\frac{1}{2}$ ' + ('б' * 3000)
+    messages = format_result({}, [{'recognition': {'answer': answer}, 'preliminary': {}}], rich=True)
+    assert all(len(message) <= 3500 for message in messages)
+    assert sum(message.count('<tg-math>') for message in messages) == 1
+    assert all(message.count('<tg-math>') == message.count('</tg-math>') for message in messages)
+    fallback = '\n'.join(rich_to_plain(message) for message in messages)
+    assert '<tg-math>' not in fallback
+    assert '(1)/(2)' in fallback
+    assert fallback.count('а') >= 2950
+    assert fallback.count('б') >= 3000
